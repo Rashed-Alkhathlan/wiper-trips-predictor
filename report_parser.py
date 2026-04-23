@@ -208,7 +208,7 @@ def build_label_series(df: pd.DataFrame) -> pd.Series:
         pd.Series of int labels (0 or 1), same index as df.
     """
     labels = pd.Series(0, index=df.index, dtype=int)
-    events = parse_all_reports()
+    events = parse_all_reports() 
 
     if not events:
         return labels

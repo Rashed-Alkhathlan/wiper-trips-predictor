@@ -66,12 +66,12 @@ This system solves that problem by:
 ┌─────────────────────────────────────────────────────────┐
 │  DATA SOURCES                                           │
 │                                                         │
-│  ┌───────────────────────┐  ┌────────────────────────┐ │
-│  │ Full CSV Dataset      │  │ Daily Drilling Reports │ │
-│  │ 608K rows × 36 cols   │  │ 163 PDFs (Oct–Jan)    │ │
-│  │ 10-second intervals   │  │ Real operational logs  │ │
-│  └───────────┬───────────┘  └──────────┬─────────────┘ │
-└──────────────┼──────────────────────────┼──────────────┘
+│  ┌───────────────────────┐  ┌────────────────────────┐  │
+│  │ Full CSV Dataset      │  │ Daily Drilling Reports │  │
+│  │ 608K rows × 36 cols   │  │ 163 PDFs (Oct–Jan)     │  │
+│  │ 10-second intervals   │  │ Real operational logs  │  │
+│  └───────────┬───────────┘  └──────────┬─────────────┘  │
+└──────────────┼──────────────────────────┼───────────────┘
                │                          │
                ▼                          ▼
 ┌──────────────────────┐    ┌──────────────────────────┐
@@ -88,20 +88,20 @@ This system solves that problem by:
 │  Feature Engineering → 77 features                      │
 │  Label Generation → Real labels + pseudo-label fallback │
 │                                                         │
-│  ┌─────────────────────┐  ┌──────────────────────────┐ │
-│  │ GradientBoostingCls │  │ Isolation Forest         │ │
-│  │ 200 trees, depth 6  │  │ 100 estimators, 15%      │ │
-│  │ learning_rate=0.1   │  │ contamination            │ │
-│  └─────────────────────┘  └──────────────────────────┘ │
+│  ┌─────────────────────┐  ┌──────────────────────────┐  │
+│  │ GradientBoostingCls │  │ Isolation Forest         │  │
+│  │ 200 trees, depth 6  │  │ 100 estimators, 15%      │  │
+│  │ learning_rate=0.1   │  │ contamination            │  │
+│  └─────────────────────┘  └──────────────────────────┘  │
 │                                                         │
-│  Ensemble: 0.65 × GBT + 0.35 × IF                      │
+│  Ensemble: 0.65 × GBT + 0.35 × IF                       │
 └────────────────────────┬────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────┐
 │  Streamlit Dashboard (app.py)                           │
 │  ┌───────────────────────────────────────────────────┐  │
-│  │ Top Bar: Well · Rig · Depth · Time · Risk Badge  │  │
+│  │ Top Bar: Well · Rig · Depth · Time · Risk Badge   │  │
 │  ├───────┬────────────────────┬──────────────────────┤  │
 │  │ Live  │  Trend Charts      │ Advisory Engine +    │  │
 │  │ Params│  (4 stacked plots) │ ML Scores + Feature  │  │
