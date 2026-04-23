@@ -198,7 +198,7 @@ def render_dashboard(idx: int):
         # ---- LEFT: Metrics ----
         with left_col:
             st.markdown(T.section_title("Live Parameters"), unsafe_allow_html=True)
-            for key in ("WOB", "RPM", "TRQ", "ROP", "SPP", "FLOW_IN"):
+            for key in ("WOB", "RPM", "TRQ", "ROP", "SPP", "FLOW_IN", "MWD_INC"):
                 st.markdown(
                     T.metric_card(
                         label=DISPLAY_LABELS.get(key, key),
