@@ -2,11 +2,11 @@
 Daily Drilling Report Parser
 ==============================
 Extracts real wiper trip / ream / short trip events from PDF reports.
-Maps them onto 10-second interval timestamps for ML training labels.
+Provides an event timeline for window-based ML labeling.
 
 Usage:
-    from report_parser import build_label_series
-    labels = build_label_series(df)  # df with DatetimeIndex or 'Time' col
+    from report_parser import build_event_timeline
+    events = build_event_timeline(df)  # list of (start_dt, end_dt, type, weight)
 """
 
 import os
@@ -60,6 +60,16 @@ _COMPILED_PATTERNS = [
     (re.compile(p, re.IGNORECASE), etype, weight)
     for p, etype, weight in _EVENT_PATTERNS
 ]
+
+# ---------------------------------------------------------------------------
+# Reactive event types — events that indicate the *need* for a wiper trip.
+# Planned trip-out / POOH operations are excluded because they don't
+# represent deteriorating conditions that require prediction.
+# ---------------------------------------------------------------------------
+REACTIVE_EVENT_TYPES = {
+    "wiper_trip", "short_trip", "reaming", "back_ream", "ream_shoe",
+    "tight_spot", "high_torque", "stuck_pipe", "pack_off", "overpull", "drag",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -179,8 +189,8 @@ def parse_all_reports(report_dir: Optional[str] = None) -> list[dict]:
             continue
         fpath = os.path.join(rdir, fname)
         for evt in _parse_report(fpath):
-            # De-duplicate: same date + event_type + description
-            key = (evt["date"], evt["event_type"], evt["description"][:80])
+            # De-duplicate: same date + event_type + full description
+            key = (evt["date"], evt["event_type"], evt["description"])
             if key not in seen:
                 seen.add(key)
                 all_events.append(evt)
@@ -190,22 +200,82 @@ def parse_all_reports(report_dir: Optional[str] = None) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Build label series aligned to a DataFrame
+# Build event timeline for window-based labeling
+# ---------------------------------------------------------------------------
+def build_event_timeline(df: pd.DataFrame,
+                         reactive_only: bool = True) -> list[dict]:
+    """Build a list of events with precise datetime ranges.
+
+    Only includes events with precise time information (no midday guessing).
+    When reactive_only=True, excludes planned trip_out/POOH events.
+
+    Args:
+        df: DataFrame with a 'Time' column (datetime) — used to determine
+            the data time range for filtering.
+        reactive_only: If True, only include REACTIVE_EVENT_TYPES.
+
+    Returns:
+        List of dicts with keys:
+            start_dt, end_dt, event_type, weight, description
+    """
+    all_events = parse_all_reports()
+    if not all_events:
+        return []
+
+    # Determine data time range
+    times = pd.to_datetime(df["Time"] if "Time" in df.columns else df.index)
+    data_start = times.min()
+    data_end = times.max()
+
+    timeline = []
+    for evt in all_events:
+        # Filter by event type
+        if reactive_only and evt["event_type"] not in REACTIVE_EVENT_TYPES:
+            continue
+
+        # Skip events without precise time (no midday guessing)
+        if not evt["start_hour"] or not evt["end_hour"]:
+            continue
+
+        # Build precise datetime range
+        start_dt = datetime.combine(evt["date"], evt["start_hour"])
+        end_dt = datetime.combine(evt["date"], evt["end_hour"])
+
+        # Handle overnight (e.g. 22:00 → 02:00)
+        if end_dt <= start_dt:
+            end_dt += timedelta(days=1)
+
+        # Skip events outside data range
+        if end_dt < data_start.to_pydatetime() or start_dt > data_end.to_pydatetime():
+            continue
+
+        timeline.append({
+            "start_dt": start_dt,
+            "end_dt": end_dt,
+            "event_type": evt["event_type"],
+            "weight": evt["weight"],
+            "description": evt["description"],
+        })
+
+    timeline.sort(key=lambda e: e["start_dt"])
+    return timeline
+
+
+# ---------------------------------------------------------------------------
+# Legacy label series (kept for backward compatibility)
 # ---------------------------------------------------------------------------
 def build_label_series(df: pd.DataFrame) -> pd.Series:
     """Build a binary label series (0/1) for the drilling DataFrame.
+
+    DEPRECATED: Use build_event_timeline() with window-based labeling instead.
+    This function is kept for backward compatibility with the dumb-classifier
+    notebook.
 
     Maps report-mined events onto the time-series data by matching
     report dates. For each report date with events, a time window
     around the event is labeled as 1 (high risk).
 
     If no report PDFs are available, returns all zeros.
-
-    Args:
-        df: DataFrame with a 'Time' column (datetime).
-
-    Returns:
-        pd.Series of int labels (0 or 1), same index as df.
     """
     labels = pd.Series(0, index=df.index, dtype=int)
     events = parse_all_reports()
@@ -213,51 +283,31 @@ def build_label_series(df: pd.DataFrame) -> pd.Series:
     if not events:
         return labels
 
-    # Ensure Time column is datetime
     times = pd.to_datetime(df["Time"] if "Time" in df.columns else df.index)
 
     for evt in events:
-        evt_date = evt["date"]
         weight = evt["weight"]
-
-        # Only label high-confidence events
         if weight < 0.7:
             continue
 
-        # Find rows matching this report date
-        date_mask = times.dt.date == evt_date
-
         if evt["start_hour"] and evt["end_hour"]:
-            # Precise time window from the report
-            start_dt = datetime.combine(evt_date, evt["start_hour"])
-            end_dt = datetime.combine(evt_date, evt["end_hour"])
-
-            # Handle overnight (e.g. 22:00 → 02:00)
+            start_dt = datetime.combine(evt["date"], evt["start_hour"])
+            end_dt = datetime.combine(evt["date"], evt["end_hour"])
             if end_dt <= start_dt:
                 end_dt += timedelta(days=1)
 
-            # Expand window by 30 min on each side (early warning)
             start_dt -= timedelta(minutes=30)
             end_dt += timedelta(minutes=30)
 
             time_mask = (times >= start_dt) & (times <= end_dt)
             labels.loc[time_mask] = 1
-        else:
-            # No precise time — label a 4-hour window around midday
-            # (avoids labeling entire 24h which inflates positive rate)
-            mid = datetime.combine(evt_date, datetime.strptime("12:00", "%H:%M").time())
-            fallback_start = mid - timedelta(hours=2)
-            fallback_end = mid + timedelta(hours=2)
-            time_mask = (times >= fallback_start) & (times <= fallback_end)
-            labels.loc[time_mask] = 1
+        # No midday fallback — events without time are skipped
 
-        # Also label a 2-hour "approach window" before the event
-        # (the model should learn to predict risk BEFORE the event)
         if evt["start_hour"]:
             approach_start = datetime.combine(
-                evt_date, evt["start_hour"]
+                evt["date"], evt["start_hour"]
             ) - timedelta(hours=2)
-            approach_end = datetime.combine(evt_date, evt["start_hour"])
+            approach_end = datetime.combine(evt["date"], evt["start_hour"])
             approach_mask = (times >= approach_start) & (times <= approach_end)
             labels.loc[approach_mask] = 1
 
@@ -279,8 +329,19 @@ def get_event_summary() -> dict:
         t = e["event_type"]
         type_counts[t] = type_counts.get(t, 0) + 1
 
+    # Count reactive events
+    reactive_count = sum(
+        1 for e in events if e["event_type"] in REACTIVE_EVENT_TYPES
+    )
+    reactive_with_time = sum(
+        1 for e in events
+        if e["event_type"] in REACTIVE_EVENT_TYPES and e["start_hour"]
+    )
+
     return {
         "n_events": len(events),
+        "n_reactive_events": reactive_count,
+        "n_reactive_with_time": reactive_with_time,
         "n_dates": len(dates),
         "event_types": type_counts,
         "date_range": (min(dates).isoformat(), max(dates).isoformat()),
@@ -293,9 +354,12 @@ def get_event_summary() -> dict:
 if __name__ == "__main__":
     summary = get_event_summary()
     print(f"Parsed {summary['n_events']} events across {summary['n_dates']} dates")
+    print(f"  Reactive events: {summary['n_reactive_events']}")
+    print(f"  Reactive with time: {summary['n_reactive_with_time']}")
     print(f"Date range: {summary.get('date_range', 'N/A')}")
     print("\nEvent type breakdown:")
     for etype, count in sorted(
         summary["event_types"].items(), key=lambda x: -x[1]
     ):
-        print(f"  {etype:20s} {count:3d}")
+        marker = " ← reactive" if etype in REACTIVE_EVENT_TYPES else " (excluded)"
+        print(f"  {etype:20s} {count:3d}{marker}")

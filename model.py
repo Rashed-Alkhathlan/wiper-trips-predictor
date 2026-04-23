@@ -1,19 +1,24 @@
 """
-Wiper Trip ML Predictor
-========================
-Two-model ensemble for wiper trip risk prediction:
-  1. Gradient Boosted Trees — trained on real labels from daily reports
-     (with pseudo-label fallback when no reports available)
-  2. Isolation Forest — unsupervised anomaly detection
+Wiper Trip ML Predictor — Window-Based Architecture
+=====================================================
+Predicts whether a wiper trip will be needed within the next
+PREDICTION_HORIZON hours, based on 30-minute aggregate windows
+of drilling sensor data.
 
-Final score: 0.65 × GBT_probability + 0.35 × IF_anomaly_score
+Key design decisions:
+  - Samples are 30-minute aggregate windows (not individual 10s readings)
+  - Labels come ONLY from external ground truth (daily report events)
+  - NO pseudo-labels (no circular feature→label dependency)
+  - Strict temporal train/test split (no future leakage)
+  - Calibrated probabilities via CalibratedClassifierCV
+  - Ensemble: 0.65 × calibrated GBT + 0.35 × Isolation Forest
 """
 
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingClassifier, IsolationForest
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import classification_report, roc_auc_score
 import warnings
 
@@ -22,9 +27,15 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # Bit diameter for MSE calculation
 BIT_DIAMETER_IN = 8.5
 
+# How far ahead we predict (hours)
+PREDICTION_HORIZON_HOURS = 4
+
+# Window size for aggregation (minutes)
+WINDOW_MINUTES = 30
+
 
 # ---------------------------------------------------------------------------
-# Feature Engineering Pipeline
+# MSE Calculation
 # ---------------------------------------------------------------------------
 
 def compute_mse_series(df: pd.DataFrame) -> pd.Series:
@@ -38,215 +49,232 @@ def compute_mse_series(df: pd.DataFrame) -> pd.Series:
     return mse
 
 
-def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Engineer 50+ features from raw drilling parameters.
+# ---------------------------------------------------------------------------
+# Window-Based Feature Engineering
+# ---------------------------------------------------------------------------
 
-    Features include:
-    - Raw parameters (base + extended)
-    - Rolling means (windows: 10, 30)
-    - Rolling standard deviations
-    - Rate of change (first derivative)
-    - Cross-feature ratios
-    - Lagged values
-    - Hookload/drag features (if available)
-    - Pit gain/loss features (if available)
-    - Block position derivative (pipe velocity)
+def _compute_trend(series: pd.Series) -> float:
+    """Linear regression slope over a series (trend direction)."""
+    n = len(series)
+    if n < 3:
+        return 0.0
+    x = np.arange(n, dtype=float)
+    y = series.values.astype(float)
+    mask = np.isfinite(y)
+    if mask.sum() < 3:
+        return 0.0
+    x, y = x[mask], y[mask]
+    # Simple OLS slope
+    x_mean = x.mean()
+    y_mean = y.mean()
+    denom = ((x - x_mean) ** 2).sum()
+    if denom == 0:
+        return 0.0
+    return float(((x - x_mean) * (y - y_mean)).sum() / denom)
+
+
+def engineer_window_features(window: pd.DataFrame) -> dict:
+    """Engineer aggregate features from a single time window.
+
+    This function is used IDENTICALLY at training and prediction time
+    to ensure feature consistency.
+
+    Args:
+        window: DataFrame slice containing sensor readings for one window.
+
+    Returns:
+        dict of feature_name → float value
     """
-    feat = pd.DataFrame(index=df.index)
+    feat = {}
 
-    # Base columns (always available)
+    # Base sensor columns
     base_cols = ["WOB", "ROP", "RPM", "TRQ", "SPP", "FLOW_IN", "DH_TRQ", "DIFF_P"]
-
-    # Extended columns (full CSV only — add if present)
     ext_cols = ["HOOKLOAD", "GAS", "RETURN_FLOW", "PIT_GL", "TRIP_GL", "MWD_INC"]
-    available_ext = [c for c in ext_cols if c in df.columns]
+    available_ext = [c for c in ext_cols if c in window.columns]
+    all_cols = base_cols + available_ext
 
-    # --- Raw values ---
-    for col in base_cols:
-        feat[col] = df[col]
-    for col in available_ext:
-        feat[col] = df[col]
+    # --- Aggregate statistics for all channels ---
+    for col in all_cols:
+        s = window[col]
+        feat[f"{col}_mean"] = s.mean()
+        feat[f"{col}_std"] = s.std() if len(s) > 1 else 0.0
+        feat[f"{col}_min"] = s.min()
+        feat[f"{col}_max"] = s.max()
+
+    # --- Trends (slope over window) for key channels ---
+    for col in ["ROP", "TRQ", "SPP", "DH_TRQ", "FLOW_IN"]:
+        feat[f"{col}_trend"] = _compute_trend(window[col])
 
     # --- MSE ---
-    feat["MSE"] = compute_mse_series(df)
+    mse = compute_mse_series(window)
+    feat["MSE_mean"] = mse.mean()
+    feat["MSE_max"] = mse.max()
+    feat["MSE_std"] = mse.std() if len(mse) > 1 else 0.0
+    feat["MSE_trend"] = _compute_trend(mse)
 
-    # --- Rolling means (10, 30) ---
-    for win in [10, 30]:
-        for col in base_cols:
-            feat[f"{col}_mean_{win}"] = df[col].rolling(win, min_periods=1).mean()
+    # --- Cross-feature ratios (computed from window means) ---
+    rop_mean = max(feat["ROP_mean"], 0.1)
+    trq_mean = max(feat["TRQ_mean"], 0.1)
+    spp_mean = max(feat["SPP_mean"], 1.0)
+    flow_mean = max(feat["FLOW_IN_mean"], 1.0)
 
-    # --- Rolling std (volatility) ---
-    for col in ["ROP", "TRQ", "SPP", "DH_TRQ"]:
-        feat[f"{col}_std_10"] = df[col].rolling(10, min_periods=1).std().fillna(0)
-        feat[f"{col}_std_30"] = df[col].rolling(30, min_periods=1).std().fillna(0)
+    feat["TRQ_ROP_ratio"] = trq_mean / rop_mean
+    feat["MSE_x_RPM"] = feat["MSE_mean"] * feat["RPM_mean"]
+    feat["DH_TRQ_diff"] = feat.get("DH_TRQ_mean", 0) - trq_mean
+    feat["Flow_pressure_ratio"] = flow_mean / spp_mean
+    feat["WOB_TRQ_ratio"] = feat["WOB_mean"] / trq_mean
 
-    # --- Rate of change (derivative) ---
-    for col in ["ROP", "TRQ", "SPP", "FLOW_IN", "DH_TRQ"]:
-        feat[f"{col}_roc"] = df[col].diff().fillna(0)
+    # --- Range / volatility ratios ---
+    feat["TRQ_range"] = feat["TRQ_max"] - feat["TRQ_min"]
+    feat["SPP_range"] = feat["SPP_max"] - feat["SPP_min"]
+    feat["ROP_range"] = feat["ROP_max"] - feat["ROP_min"]
 
-    # --- Percent change over rolling windows ---
-    for col in ["ROP", "TRQ", "SPP"]:
-        mean_10 = df[col].rolling(10, min_periods=1).mean()
-        mean_30 = df[col].rolling(30, min_periods=1).mean()
-        feat[f"{col}_pct_10v30"] = ((mean_10 - mean_30) / mean_30.clip(lower=1)).fillna(0) * 100
+    # --- Hookload features ---
+    if "HOOKLOAD" in window.columns:
+        hl = window["HOOKLOAD"]
+        feat["HOOKLOAD_trend"] = _compute_trend(hl)
+        hl_mean = hl.mean()
+        hl_std = hl.std() if len(hl) > 1 else 0.0
+        feat["HOOKLOAD_cv"] = hl_std / max(hl_mean, 1.0)
 
-    # --- Cross-feature ratios ---
-    feat["TRQ_ROP_ratio"] = (df["TRQ"] / df["ROP"].clip(lower=0.1))
-    feat["MSE_x_RPM"] = feat["MSE"] * df["RPM"]
-    feat["DH_TRQ_diff"] = df["DH_TRQ"] - df["TRQ"]
-    feat["Flow_pressure_ratio"] = df["FLOW_IN"] / df["SPP"].clip(lower=1)
-    feat["WOB_TRQ_ratio"] = df["WOB"] / df["TRQ"].clip(lower=1)
+    # --- Pit gain/loss features ---
+    if "PIT_GL" in window.columns:
+        gl = window["PIT_GL"]
+        feat["PIT_GL_abs_sum"] = gl.abs().sum()
+        feat["PIT_GL_abs_max"] = gl.abs().max()
+        feat["PIT_GL_trend"] = _compute_trend(gl)
 
-    # --- Lagged values ---
-    for col in ["ROP", "TRQ", "SPP"]:
-        feat[f"{col}_lag_5"] = df[col].shift(5).fillna(df[col])
-        feat[f"{col}_lag_10"] = df[col].shift(10).fillna(df[col])
+    # --- Return flow balance ---
+    if "RETURN_FLOW" in window.columns and "FLOW_IN" in window.columns:
+        ret = window["RETURN_FLOW"]
+        flow = window["FLOW_IN"]
+        feat["FLOW_RATIO_mean"] = (ret / flow.clip(lower=1.0)).mean()
+        feat["FLOW_IMBALANCE_mean"] = (ret - flow).mean()
+        feat["FLOW_IMBALANCE_std"] = (ret - flow).std() if len(ret) > 1 else 0.0
 
-    # --- MSE rolling features ---
-    feat["MSE_mean_10"] = feat["MSE"].rolling(10, min_periods=1).mean()
-    feat["MSE_mean_30"] = feat["MSE"].rolling(30, min_periods=1).mean()
-    feat["MSE_std_10"] = feat["MSE"].rolling(10, min_periods=1).std().fillna(0)
-    feat["MSE_roc"] = feat["MSE"].diff().fillna(0)
+    # --- Gas features ---
+    if "GAS" in window.columns:
+        gas = window["GAS"]
+        feat["GAS_max"] = gas.max()
+        feat["GAS_trend"] = _compute_trend(gas)
 
-    # ===========================================================
-    # Extended features from full CSV
-    # ===========================================================
+    # --- MWD Inclination ---
+    if "MWD_INC" in window.columns:
+        inc = window["MWD_INC"]
+        feat["MWD_INC_mean"] = inc.mean()
+        feat["MWD_INC_max"] = inc.max()
+        feat["INC_HIGH_ANGLE_frac"] = (inc > 30).mean()
+        feat["INC_CRITICAL_frac"] = (inc > 60).mean()
+        feat["INC_x_TRQ"] = inc.mean() * trq_mean / 1000.0
+        feat["INC_x_MSE"] = inc.mean() * feat["MSE_mean"] / 1000.0
 
-    # --- Hookload features (drag/friction indicator) ---
-    if "HOOKLOAD" in df.columns:
-        feat["HOOKLOAD_mean_10"] = df["HOOKLOAD"].rolling(10, min_periods=1).mean()
-        feat["HOOKLOAD_std_10"] = df["HOOKLOAD"].rolling(10, min_periods=1).std().fillna(0)
-        feat["HOOKLOAD_roc"] = df["HOOKLOAD"].diff().fillna(0)
-        # Drag estimate: delta from rolling mean
-        feat["HOOKLOAD_drag"] = (
-            df["HOOKLOAD"] - df["HOOKLOAD"].rolling(30, min_periods=1).mean()
-        ).fillna(0)
+    # --- Block position (pipe movement) ---
+    if "BLOCK_POS" in window.columns:
+        bp = window["BLOCK_POS"]
+        vel = bp.diff().fillna(0)
+        feat["BLOCK_VEL_mean"] = vel.mean()
+        feat["BLOCK_VEL_abs_mean"] = vel.abs().mean()
+        feat["BLOCK_VEL_std"] = vel.std() if len(vel) > 1 else 0.0
 
-    # --- Block position features (pipe movement) ---
-    if "BLOCK_POS" in df.columns:
-        feat["BLOCK_VEL"] = df["BLOCK_POS"].diff().fillna(0)
-        feat["BLOCK_ACCEL"] = feat["BLOCK_VEL"].diff().fillna(0)
-        feat["BLOCK_VEL_abs"] = feat["BLOCK_VEL"].abs()
-
-    # --- Pit gain/loss (hole cleaning indicator) ---
-    if "PIT_GL" in df.columns:
-        feat["PIT_GL_sum_10"] = df["PIT_GL"].rolling(10, min_periods=1).sum().fillna(0)
-        feat["PIT_GL_sum_30"] = df["PIT_GL"].rolling(30, min_periods=1).sum().fillna(0)
-        feat["PIT_GL_abs_max_10"] = (
-            df["PIT_GL"].abs().rolling(10, min_periods=1).max().fillna(0)
-        )
-
-    # --- Return flow ratio (loss/gain detection) ---
-    if "RETURN_FLOW" in df.columns and "FLOW_IN" in df.columns:
-        feat["FLOW_RATIO"] = (
-            df["RETURN_FLOW"] / df["FLOW_IN"].clip(lower=1)
-        ).fillna(1.0)
-        feat["FLOW_IMBALANCE"] = (df["RETURN_FLOW"] - df["FLOW_IN"]).fillna(0)
-
-    # --- Gas proximity ---
-    if "GAS" in df.columns:
-        feat["GAS_max_10"] = df["GAS"].rolling(10, min_periods=1).max().fillna(0)
-        feat["GAS_roc"] = df["GAS"].diff().fillna(0)
-
-    # --- Trip volume features ---
-    if "TRIP_GL" in df.columns:
-        feat["TRIP_GL_sum_10"] = df["TRIP_GL"].rolling(10, min_periods=1).sum().fillna(0)
-
-    # --- On-bottom duration ---
-    if "ON_BOTTOM" in df.columns:
-        feat["ON_BOTTOM_run"] = (
-            df["ON_BOTTOM"]
-            .groupby((df["ON_BOTTOM"] != df["ON_BOTTOM"].shift()).cumsum())
-            .cumcount()
-        )
-
-    # --- MWD Inclination features (critical for hole cleaning) ---
-    # Higher angles (>30°) dramatically worsen cuttings transport;
-    # near-horizontal (>60°) requires aggressive wiper trip management.
-    if "MWD_INC" in df.columns:
-        feat["MWD_INC"] = df["MWD_INC"]
-        feat["INC_HIGH_ANGLE"] = (df["MWD_INC"] > 30).astype(float)
-        feat["INC_CRITICAL"] = (df["MWD_INC"] > 60).astype(float)
-        # Interaction: torque at high angle is much worse than at vertical
-        feat["INC_x_TRQ"] = df["MWD_INC"] * df["TRQ"] / 1000.0
-        # Interaction: MSE at high angle = compounded inefficiency
-        feat["INC_x_MSE"] = df["MWD_INC"] * feat["MSE"] / 1000.0
-
-    # Replace inf/nan
-    feat = feat.replace([np.inf, -np.inf], np.nan).fillna(0)
+    # --- On-bottom fraction ---
+    if "ON_BOTTOM" in window.columns:
+        feat["ON_BOTTOM_frac"] = window["ON_BOTTOM"].mean()
 
     return feat
 
 
-# ---------------------------------------------------------------------------
-# Label Generation (Real + Pseudo)
-# ---------------------------------------------------------------------------
+def create_windows(df: pd.DataFrame,
+                   window_minutes: int = WINDOW_MINUTES) -> pd.DataFrame:
+    """Split the time-series into non-overlapping windows and compute features.
 
-def generate_labels(df: pd.DataFrame, feat: pd.DataFrame) -> pd.Series:
-    """Generate wiper trip risk labels using real report data + pseudo-labels.
+    Each window becomes one training sample.
 
-    Priority:
-    1. Real labels from daily drilling reports (if available)
-    2. Pseudo-labels from domain heuristics (fallback / supplement)
+    Args:
+        df: Full dataset with renamed columns and 'Time' column.
+        window_minutes: Duration of each window in minutes.
+
+    Returns:
+        DataFrame where each row is one window with:
+        - window_start, window_end (datetime)
+        - window_idx (integer index)
+        - All engineered features
     """
-    # --- Try real labels from reports ---
-    try:
-        from report_parser import build_label_series
-        real_labels = build_label_series(df)
-        n_real = int(real_labels.sum())
-    except Exception:
-        real_labels = pd.Series(0, index=df.index, dtype=int)
-        n_real = 0
+    times = pd.to_datetime(df["Time"])
+    t_start = times.min()
+    t_end = times.max()
 
-    # --- Pseudo-labels from domain rules ---
-    mse = feat["MSE"]
-    mse_p75 = mse.quantile(0.75)
-    mse_p90 = mse.quantile(0.90)
+    window_delta = pd.Timedelta(minutes=window_minutes)
+    windows = []
 
-    high_mse = (mse > mse_p75).astype(float)
-    very_high_mse = (mse > mse_p90).astype(float)
-    trq_increasing = (feat["TRQ_pct_10v30"] > 5).astype(float)
-    spp_increasing = (feat["SPP_pct_10v30"] > 3).astype(float)
-    rop_decreasing = (feat["ROP_pct_10v30"] < -5).astype(float)
-    trq_volatile = (feat["TRQ_std_10"] > feat["TRQ_std_10"].quantile(0.80)).astype(float)
-    dh_trq_diff = (feat["DH_TRQ_diff"] > feat["DH_TRQ_diff"].quantile(0.85)).astype(float)
+    current_start = t_start
+    window_idx = 0
 
-    # Add extended signals if available
-    hookload_signal = 0.0
-    if "HOOKLOAD_drag" in feat.columns:
-        hookload_signal = (
-            feat["HOOKLOAD_drag"].abs() > feat["HOOKLOAD_drag"].abs().quantile(0.85)
-        ).astype(float)
+    while current_start + window_delta <= t_end:
+        current_end = current_start + window_delta
+        mask = (times >= current_start) & (times < current_end)
+        window_data = df.loc[mask]
 
-    pit_gl_signal = 0.0
-    if "PIT_GL_abs_max_10" in feat.columns:
-        pit_gl_signal = (
-            feat["PIT_GL_abs_max_10"] > feat["PIT_GL_abs_max_10"].quantile(0.85)
-        ).astype(float)
+        if len(window_data) >= 10:  # Need at least 10 readings per window
+            feat = engineer_window_features(window_data)
+            feat["window_start"] = current_start
+            feat["window_end"] = current_end
+            feat["window_idx"] = window_idx
+            feat["n_readings"] = len(window_data)
+            windows.append(feat)
+            window_idx += 1
 
-    pseudo_score = (
-        0.20 * high_mse
-        + 0.12 * very_high_mse
-        + 0.12 * trq_increasing
-        + 0.12 * spp_increasing
-        + 0.10 * rop_decreasing
-        + 0.08 * trq_volatile
-        + 0.08 * dh_trq_diff
-        + 0.09 * hookload_signal
-        + 0.09 * pit_gl_signal
-    )
-    pseudo_labels = (pseudo_score > 0.30).astype(int)
+        current_start = current_end
 
-    # --- Blend: real labels dominate ---
-    if n_real > 50:
-        # Real labels available — use them as primary, pseudo as supplement
-        labels = real_labels.copy()
-        # Add pseudo-labeled high-confidence points not covered by reports
-        supplement_mask = (pseudo_labels == 1) & (real_labels == 0) & (pseudo_score > 0.5)
-        labels.loc[supplement_mask] = 1
-    else:
-        # No real labels — fall back to pseudo-labels
-        labels = pseudo_labels
+    result = pd.DataFrame(windows)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Label Generation (from external ground truth ONLY)
+# ---------------------------------------------------------------------------
+
+def create_labels(windows_df: pd.DataFrame,
+                  events: list[dict],
+                  horizon_hours: float = PREDICTION_HORIZON_HOURS) -> pd.Series:
+    """Create binary labels for each window based on external events.
+
+    Label = 1 if a reactive event STARTS within horizon_hours after
+    the window's end time.
+
+    Windows that overlap with an event (i.e., during the event) are
+    EXCLUDED from training to prevent the model from learning
+    "currently tripping" patterns.
+
+    Args:
+        windows_df: DataFrame from create_windows() with window_start/end.
+        events: List of event dicts from build_event_timeline().
+        horizon_hours: How far ahead to predict.
+
+    Returns:
+        pd.Series of labels (0, 1, or -1 for excluded windows).
+        -1 means "during an event — exclude from training".
+    """
+    labels = pd.Series(0, index=windows_df.index, dtype=int)
+    horizon = pd.Timedelta(hours=horizon_hours)
+
+    for i, row in windows_df.iterrows():
+        w_start = row["window_start"]
+        w_end = row["window_end"]
+
+        for evt in events:
+            evt_start = pd.Timestamp(evt["start_dt"])
+            evt_end = pd.Timestamp(evt["end_dt"])
+
+            # Check if window overlaps with event → exclude
+            if w_start < evt_end and w_end > evt_start:
+                labels.iloc[i] = -1
+                break
+
+            # Check if event starts within prediction horizon after window
+            time_until_event = evt_start - w_end
+            if pd.Timedelta(0) <= time_until_event <= horizon:
+                labels.iloc[i] = 1
+                break  # Found an event in horizon, no need to check more
 
     return labels
 
@@ -256,20 +284,26 @@ def generate_labels(df: pd.DataFrame, feat: pd.DataFrame) -> pd.Series:
 # ---------------------------------------------------------------------------
 
 class WiperTripPredictor:
-    """Ensemble model for wiper trip risk prediction."""
+    """Window-based ensemble model for wiper trip prediction.
+
+    Predicts whether a wiper trip will be needed within the next
+    PREDICTION_HORIZON hours based on the current 30-minute window
+    of sensor data.
+    """
 
     def __init__(self):
-        self.gbt_model = GradientBoostingClassifier(
+        self._base_gbt = GradientBoostingClassifier(
             n_estimators=200,
-            max_depth=6,
+            max_depth=5,
             learning_rate=0.1,
             subsample=0.8,
-            min_samples_leaf=20,
+            min_samples_leaf=10,
             random_state=42,
         )
+        self.gbt_model = None  # Will be CalibratedClassifierCV
         self.if_model = IsolationForest(
             n_estimators=100,
-            contamination=0.15,
+            contamination="auto",
             random_state=42,
             n_jobs=-1,
         )
@@ -277,9 +311,24 @@ class WiperTripPredictor:
         self.feature_names = []
         self.is_trained = False
         self.training_metrics = {}
+        self._windows_df = None  # Cache for prediction-time reference
+
+    def _get_feature_columns(self, windows_df: pd.DataFrame) -> list[str]:
+        """Get feature column names (exclude metadata columns)."""
+        meta_cols = {"window_start", "window_end", "window_idx", "n_readings"}
+        return [c for c in windows_df.columns if c not in meta_cols]
 
     def train(self, df: pd.DataFrame) -> dict:
-        """Train both models on the provided drilling data.
+        """Train the model on the provided drilling data.
+
+        Steps:
+        1. Create 30-minute windows with aggregate features
+        2. Get event timeline from reports (reactive events only)
+        3. Label windows: 1 if event within horizon, -1 if during event
+        4. Temporal split: first 80% train, last 20% test
+        5. Train GBT with Platt scaling calibration
+        6. Train Isolation Forest on training data only
+        7. Report honest metrics on temporally-separated test set
 
         Args:
             df: DataFrame with renamed columns (WOB, ROP, TRQ, etc.)
@@ -287,62 +336,108 @@ class WiperTripPredictor:
         Returns:
             Dictionary with training metrics.
         """
-        # Engineer features
-        feat = engineer_features(df)
-        self.feature_names = list(feat.columns)
+        # 1. Create windows
+        windows_df = create_windows(df, WINDOW_MINUTES)
+        self._windows_df = windows_df
 
-        # Generate labels (real + pseudo)
-        labels = generate_labels(df, feat)
+        # 2. Get event timeline
+        try:
+            from report_parser import build_event_timeline
+            events = build_event_timeline(df, reactive_only=True)
+            n_events = len(events)
+        except Exception:
+            events = []
+            n_events = 0
+
+        # 3. Create labels
+        labels = create_labels(windows_df, events, PREDICTION_HORIZON_HOURS)
+
+        # 4. Filter out excluded windows (during events)
+        valid_mask = labels != -1
+        windows_valid = windows_df[valid_mask].reset_index(drop=True)
+        labels_valid = labels[valid_mask].reset_index(drop=True)
+
+        # Get feature columns
+        feat_cols = self._get_feature_columns(windows_valid)
+        self.feature_names = feat_cols
+
+        X_all = windows_valid[feat_cols].values
+        y_all = labels_valid.values
+
+        # Replace inf/nan
+        X_all = np.nan_to_num(X_all, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 5. TEMPORAL split — first 80% train, last 20% test
+        n_total = len(X_all)
+        split_idx = int(n_total * 0.8)
+        X_train, X_test = X_all[:split_idx], X_all[split_idx:]
+        y_train, y_test = y_all[:split_idx], y_all[split_idx:]
 
         # Scale features
-        X = self.scaler.fit_transform(feat)
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
 
-        # Train/test split for validation metrics
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, labels, test_size=0.2, random_state=42, stratify=labels
-        )
+        # 6. Train GBT with calibration
+        n_pos = y_train.sum()
+        if n_pos >= 5 and (y_train == 0).sum() >= 5:
+            # Enough positive samples for calibration
+            try:
+                self.gbt_model = CalibratedClassifierCV(
+                    self._base_gbt, cv=3, method="sigmoid"
+                )
+                self.gbt_model.fit(X_train_scaled, y_train)
+            except Exception:
+                # Fallback: train without calibration
+                self._base_gbt.fit(X_train_scaled, y_train)
+                self.gbt_model = self._base_gbt
+        else:
+            # Too few positive samples — train uncalibrated
+            self._base_gbt.fit(X_train_scaled, y_train)
+            self.gbt_model = self._base_gbt
 
-        # Train Gradient Boosted Trees
-        self.gbt_model.fit(X_train, y_train)
+        # 7. Train Isolation Forest on TRAINING data only (no test leakage)
+        self.if_model.fit(X_train_scaled)
 
-        # Evaluate
-        y_pred = self.gbt_model.predict(X_test)
-        y_proba = self.gbt_model.predict_proba(X_test)[:, 1]
-
-        try:
-            auc = roc_auc_score(y_test, y_proba)
-        except ValueError:
+        # 8. Evaluate on temporally-separated test set
+        if len(X_test) > 0 and len(np.unique(y_test)) > 1:
+            y_pred = self.gbt_model.predict(X_test_scaled)
+            y_proba = self.gbt_model.predict_proba(X_test_scaled)[:, 1]
+            try:
+                auc = roc_auc_score(y_test, y_proba)
+            except ValueError:
+                auc = 0.5
+            report = classification_report(
+                y_test, y_pred, output_dict=True, zero_division=0
+            )
+        else:
             auc = 0.5
-
-        report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
-
-        # Train Isolation Forest on all data
-        self.if_model.fit(X)
+            report = {}
+            y_pred = np.array([])
 
         self.is_trained = True
 
-        # Label source info
-        try:
-            from report_parser import get_event_summary
-            evt_summary = get_event_summary()
-            n_report_events = evt_summary.get("n_events", 0)
-            label_source = "Report-Mined" if n_report_events > 50 else "Pseudo-Labels"
-        except Exception:
-            n_report_events = 0
-            label_source = "Pseudo-Labels"
+        label_source = "Report-Mined (Reactive)" if n_events > 0 else "No Events Found"
 
         self.training_metrics = {
-            "n_samples": len(df),
+            "n_total_windows": len(windows_df),
+            "n_valid_windows": int(valid_mask.sum()),
+            "n_excluded_windows": int((~valid_mask).sum()),
+            "n_train": split_idx,
+            "n_test": n_total - split_idx,
             "n_features": len(self.feature_names),
-            "positive_rate": float(labels.mean()),
+            "positive_rate_train": float(y_train.mean()) if len(y_train) > 0 else 0.0,
+            "positive_rate_test": float(y_test.mean()) if len(y_test) > 0 else 0.0,
             "auc_roc": round(auc, 4),
             "precision": round(report.get("1", {}).get("precision", 0), 3),
             "recall": round(report.get("1", {}).get("recall", 0), 3),
             "f1_score": round(report.get("1", {}).get("f1-score", 0), 3),
             "accuracy": round(report.get("accuracy", 0), 3),
             "label_source": label_source,
-            "n_report_events": n_report_events,
-            "model_type": "GBT + Isolation Forest",
+            "n_reactive_events": n_events,
+            "prediction_horizon_hrs": PREDICTION_HORIZON_HOURS,
+            "window_minutes": WINDOW_MINUTES,
+            "model_type": "Calibrated GBT + Isolation Forest",
+            "split_type": "Temporal (80/20)",
         }
 
         return self.training_metrics
@@ -350,9 +445,12 @@ class WiperTripPredictor:
     def predict(self, df: pd.DataFrame, idx: int) -> dict:
         """Predict wiper trip risk for the given index.
 
+        Creates a window from the most recent WINDOW_MINUTES of data
+        ending at idx, using the SAME feature computation as training.
+
         Returns dict with:
-            - risk_score: float 0-1
-            - rf_probability: float 0-1  (GBT probability, key kept for compat)
+            - risk_score: float 0-1 (calibrated ensemble probability)
+            - gbt_probability: float 0-1
             - if_anomaly_score: float 0-1
             - feature_importances: dict of top features
             - details: dict with component details
@@ -360,52 +458,77 @@ class WiperTripPredictor:
         if not self.is_trained:
             return {
                 "risk_score": 0.0,
-                "rf_probability": 0.0,
+                "gbt_probability": 0.0,
                 "if_anomaly_score": 0.0,
                 "feature_importances": {},
                 "details": {},
             }
 
-        # Engineer features for the window up to idx
-        start = max(0, idx - 50)
-        window_df = df.iloc[start : idx + 1].copy()
-        feat = engineer_features(window_df)
+        # Build a window from the data ending at idx
+        # Use the same window size as training
+        times = pd.to_datetime(df["Time"])
+        current_time = times.iloc[idx]
+        window_start = current_time - pd.Timedelta(minutes=WINDOW_MINUTES)
 
-        # Get last row features
-        last_feat = feat.iloc[[-1]]
-        X = self.scaler.transform(last_feat)
+        mask = (times >= window_start) & (times <= current_time)
+        window_data = df.loc[mask]
 
-        # GBT prediction
-        gbt_proba = self.gbt_model.predict_proba(X)[0][1]
+        if len(window_data) < 5:
+            # Not enough data for a meaningful window, use what we have
+            start = max(0, idx - 50)
+            window_data = df.iloc[start:idx + 1]
+
+        # Engineer features using the SAME function as training
+        feat_dict = engineer_window_features(window_data)
+
+        # Build feature vector in the same order as training
+        feat_values = []
+        for col in self.feature_names:
+            feat_values.append(feat_dict.get(col, 0.0))
+
+        X = np.array([feat_values])
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        X_scaled = self.scaler.transform(X)
+
+        # GBT prediction (calibrated probability)
+        gbt_proba = self.gbt_model.predict_proba(X_scaled)[0][1]
 
         # Isolation Forest anomaly score
-        if_raw = self.if_model.decision_function(X)[0]
+        if_raw = self.if_model.decision_function(X_scaled)[0]
         if_score = max(0.0, min(1.0, 0.5 - if_raw * 2))
 
-        # Ensemble: 0.65 GBT + 0.35 IF
+        # Ensemble: 0.65 calibrated GBT + 0.35 IF
         risk_score = 0.65 * gbt_proba + 0.35 * if_score
         risk_score = round(max(0.0, min(1.0, risk_score)), 3)
 
-        # Feature importances (top 8)
-        importances = self.gbt_model.feature_importances_
-        feat_imp = dict(zip(self.feature_names, importances))
-        top_features = dict(
-            sorted(feat_imp.items(), key=lambda x: x[1], reverse=True)[:8]
-        )
+        # Feature importances (from base GBT estimator)
+        try:
+            if hasattr(self.gbt_model, 'calibrated_classifiers_'):
+                # CalibratedClassifierCV wraps the base estimator
+                base = self.gbt_model.calibrated_classifiers_[0].estimator
+                importances = base.feature_importances_
+            else:
+                importances = self.gbt_model.feature_importances_
+            feat_imp = dict(zip(self.feature_names, importances))
+            top_features = dict(
+                sorted(feat_imp.items(), key=lambda x: x[1], reverse=True)[:8]
+            )
+        except (AttributeError, IndexError):
+            top_features = {}
 
-        # Build details
+        # Build details for advisory
         details = {
             "rf_probability": round(gbt_proba, 3),
             "if_anomaly_score": round(if_score, 3),
-            "mse": round(float(last_feat["MSE"].iloc[0]), 1),
-            "trq_change_pct": round(float(last_feat.get("TRQ_pct_10v30", pd.Series([0])).iloc[0]), 1),
-            "spp_change_pct": round(float(last_feat.get("SPP_pct_10v30", pd.Series([0])).iloc[0]), 1),
-            "rop_change_pct": round(float(last_feat.get("ROP_pct_10v30", pd.Series([0])).iloc[0]), 1),
+            "mse": round(float(feat_dict.get("MSE_mean", 0)), 1),
+            "trq_change_pct": round(float(feat_dict.get("TRQ_trend", 0) * 100), 1),
+            "spp_change_pct": round(float(feat_dict.get("SPP_trend", 0) * 100), 1),
+            "rop_change_pct": round(float(feat_dict.get("ROP_trend", 0) * 100), 1),
             "mse_norm": round(gbt_proba, 2),
-            "trq_norm": round(float(last_feat.get("TRQ_pct_10v30", pd.Series([0])).iloc[0]) / 25, 2),
-            "spp_norm": round(float(last_feat.get("SPP_pct_10v30", pd.Series([0])).iloc[0]) / 20, 2),
-            "rop_drop_norm": round(-float(last_feat.get("ROP_pct_10v30", pd.Series([0])).iloc[0]) / 30, 2),
-            "flow_imbalance": round(abs(float(last_feat.get("Flow_pressure_ratio", pd.Series([0])).iloc[0])), 1),
+            "trq_norm": round(min(1.0, abs(feat_dict.get("TRQ_trend", 0)) / 0.5), 2),
+            "spp_norm": round(min(1.0, abs(feat_dict.get("SPP_trend", 0)) / 0.5), 2),
+            "rop_drop_norm": round(min(1.0, max(0, -feat_dict.get("ROP_trend", 0)) / 0.5), 2),
+            "flow_imbalance": round(abs(feat_dict.get("FLOW_IMBALANCE_mean", 0)), 1),
             "flow_norm": round(if_score, 2),
         }
 
@@ -422,9 +545,17 @@ class WiperTripPredictor:
         if not self.is_trained:
             return pd.DataFrame()
 
-        imp = self.gbt_model.feature_importances_
-        df = pd.DataFrame({
-            "Feature": self.feature_names,
-            "Importance": imp,
-        }).sort_values("Importance", ascending=False)
-        return df
+        try:
+            if hasattr(self.gbt_model, 'calibrated_classifiers_'):
+                base = self.gbt_model.calibrated_classifiers_[0].estimator
+                imp = base.feature_importances_
+            else:
+                imp = self.gbt_model.feature_importances_
+
+            df = pd.DataFrame({
+                "Feature": self.feature_names,
+                "Importance": imp,
+            }).sort_values("Importance", ascending=False)
+            return df
+        except (AttributeError, IndexError):
+            return pd.DataFrame()

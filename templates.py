@@ -41,7 +41,7 @@ def top_bar(depth: float, time_str: str, mode: str, risk: float,
         '    GBT + IF Ensemble</div>'
         '</div>'
         '<div class="top-bar-item">'
-        '  <div class="top-bar-label">Wiper Trip Risk</div>'
+        '  <div class="top-bar-label">4-Hour Wiper Trip Prediction</div>'
         f'  <div class="risk-badge {risk_class}">{risk:.2f} — {level}</div>'
         '</div>'
         '</div>'
@@ -128,7 +128,7 @@ def model_scores(rf_prob: float, if_score: float,
     return (
         '<div class="model-panel">'
         '  <div class="model-score-row">'
-        '    <span class="model-score-label">Gradient Boost Prob.</span>'
+        '    <span class="model-score-label">Calibrated GBT Prob.</span>'
         f'    <span class="model-score-value" style="color:{rf_c};">'
         f'      {rf_prob:.3f}</span></div>'
         '  <div class="model-score-row">'
@@ -137,7 +137,7 @@ def model_scores(rf_prob: float, if_score: float,
         f'      {if_score:.3f}</span></div>'
         '  <div class="model-score-row"'
         '       style="border-top:1px solid #334155;padding-top:8px;">'
-        '    <span class="model-score-label">Ensemble (0.65 GBT + 0.35 IF)</span>'
+        '    <span class="model-score-label">4h Prediction (0.65 GBT + 0.35 IF)</span>'
         f'    <span class="model-score-value" style="color:{risk_color};">'
         f'      {risk:.3f}</span></div>'
         '</div>'
@@ -148,22 +148,28 @@ def model_scores(rf_prob: float, if_score: float,
 # Model Information Panel
 # ---------------------------------------------------------------------------
 def model_info(metrics: dict) -> str:
-    model_type = metrics.get("model_type", "GBT + Isolation Forest")
-    label_src = metrics.get("label_source", "Pseudo-Labels")
-    n_events = metrics.get("n_report_events", 0)
+    model_type = metrics.get("model_type", "Calibrated GBT + IF")
+    label_src = metrics.get("label_source", "No Events")
+    n_events = metrics.get("n_reactive_events", 0)
     label_display = f"{label_src} ({n_events} events)" if n_events else label_src
     label_color = "#22c55e" if "Report" in label_src else "#f59e0b"
+    horizon = metrics.get("prediction_horizon_hrs", 4)
+    win_min = metrics.get("window_minutes", 30)
+    split_type = metrics.get("split_type", "Temporal")
 
     rows = [
         ("Model Type",       model_type, None),
         ("Label Source",     label_display, label_color),
+        ("Prediction Horizon", f"{horizon}h ahead", "#38bdf8"),
+        ("Window Size",      f"{win_min} min", None),
+        ("Train/Test Split", split_type, None),
         ("Features",         str(metrics.get("n_features", "—")), None),
-        ("Training Samples", f'{metrics.get("n_samples", 0):,}', None),
+        ("Train Windows",    f'{metrics.get("n_train", 0):,}', None),
+        ("Test Windows",     f'{metrics.get("n_test", 0):,}', None),
         ("AUC-ROC",          f'{metrics.get("auc_roc", 0):.4f}', "#22c55e"),
         ("Precision",        f'{metrics.get("precision", 0):.3f}', None),
         ("Recall",           f'{metrics.get("recall", 0):.3f}', None),
         ("F1-Score",         f'{metrics.get("f1_score", 0):.3f}', None),
-        ("Accuracy",         f'{metrics.get("accuracy", 0):.3f}', None),
     ]
     html = '<div class="model-panel">'
     for label, value, color in rows:

@@ -309,25 +309,25 @@ def generate_advisory(risk: float, details: dict) -> dict:
 
     # Interpretation
     if risk > 0.7:
-        interpretation = "Likely cuttings accumulation and inadequate hole cleaning. Wellbore conditions are deteriorating."
+        interpretation = "High probability of needing a wiper trip within the next 4 hours. Likely cuttings accumulation and inadequate hole cleaning."
         actions = [
             "Increase flow rate by 10-15%",
             "Reduce ROP to improve hole cleaning",
-            "Prepare for wiper trip if condition persists",
+            "Prepare for wiper trip",
             "Monitor downhole torque closely",
         ]
-        recommendation = "Perform Wiper Trip"
+        recommendation = "Wiper Trip Predicted"
     elif risk > 0.4:
-        interpretation = "Early signs of hole cleaning deterioration detected. Increased monitoring recommended."
+        interpretation = "Moderate probability of needing a wiper trip within the next 4 hours. Early signs of hole cleaning deterioration."
         actions = [
             "Increase flow rate by 5-10%",
             "Monitor torque and pressure trends",
             "Maintain current ROP or reduce slightly",
             "Prepare contingency for wiper trip",
         ]
-        recommendation = "Increase Flow / Monitor"
+        recommendation = "Prepare / Monitor"
     else:
-        interpretation = "Wellbore conditions are stable. Normal drilling operations can continue."
+        interpretation = "Low probability of needing a wiper trip within the next 4 hours. Wellbore conditions are stable."
         actions = [
             "Continue current drilling parameters",
             "Maintain flow rate",
@@ -335,7 +335,9 @@ def generate_advisory(risk: float, details: dict) -> dict:
         ]
         recommendation = "Continue Drilling"
 
-    confidence = min(0.95, 0.60 + risk * 0.35 + len(reasons) * 0.03)
+    # Use the model's calibrated probability as confidence
+    # (the GBT is calibrated via CalibratedClassifierCV / Platt scaling)
+    confidence = round(max(0.0, min(1.0, risk)), 2)
 
     return {
         "level": level,
@@ -344,7 +346,7 @@ def generate_advisory(risk: float, details: dict) -> dict:
         "reasons": reasons,
         "interpretation": interpretation,
         "actions": actions,
-        "confidence": round(confidence, 2),
+        "confidence": confidence,
     }
 
 
@@ -363,18 +365,18 @@ def generate_events(df: pd.DataFrame, idx: int, prev_feats: dict | None) -> list
 
     events = []
 
-    # Torque spike
-    if feats["TRQ_pct_change"] > 8:
-        events.append({
-            "time": time_str,
-            "message": f"Surface torque increased {feats['TRQ_pct_change']:.0f}%",
-            "severity": "warning",
-        })
-    elif feats["TRQ_pct_change"] > 15:
+    # Torque spike — check higher threshold first
+    if feats["TRQ_pct_change"] > 15:
         events.append({
             "time": time_str,
             "message": f"Surface torque spike: +{feats['TRQ_pct_change']:.0f}%",
             "severity": "critical",
+        })
+    elif feats["TRQ_pct_change"] > 8:
+        events.append({
+            "time": time_str,
+            "message": f"Surface torque increased {feats['TRQ_pct_change']:.0f}%",
+            "severity": "warning",
         })
 
     # Pressure increase

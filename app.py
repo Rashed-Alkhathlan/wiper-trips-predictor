@@ -75,28 +75,38 @@ def get_trained_model(_df):
 
 
 df = get_data()
-with st.spinner("Training ML models (GBT + Isolation Forest) on real labels..."):
+with st.spinner("Training ML models on 30-min windows (temporal split, calibrated)..."):
     ml_model, training_metrics = get_trained_model(df)
 
 # ---------------------------------------------------------------------------
 # Feature-name mapping for the importance chart
 # ---------------------------------------------------------------------------
 FEAT_NAME_MAP = {
-    "MSE": "MSE", "MSE_mean_10": "MSE (avg 10)", "MSE_mean_30": "MSE (avg 30)",
-    "MSE_std_10": "MSE (vol)", "MSE_roc": "MSE (chg)",
-    "TRQ": "Torque", "TRQ_mean_10": "Torque (avg)", "TRQ_std_10": "Torque (vol)",
-    "TRQ_roc": "Torque (chg)", "TRQ_pct_10v30": "Torque (trend)",
-    "SPP": "Pressure", "SPP_mean_10": "Press (avg)", "SPP_std_10": "Press (vol)",
-    "SPP_roc": "Press (chg)", "SPP_pct_10v30": "Press (trend)",
-    "ROP": "ROP", "ROP_mean_10": "ROP (avg)", "ROP_std_10": "ROP (vol)",
-    "ROP_roc": "ROP (chg)", "ROP_pct_10v30": "ROP (trend)",
-    "WOB": "WOB", "FLOW_IN": "Flow", "DH_TRQ": "DH Torque", "DIFF_P": "Diff Press",
+    "MSE_mean": "MSE (avg)", "MSE_max": "MSE (max)", "MSE_std": "MSE (vol)",
+    "MSE_trend": "MSE (trend)",
+    "TRQ_mean": "Torque (avg)", "TRQ_std": "Torque (vol)", "TRQ_trend": "Torque (trend)",
+    "TRQ_min": "Torque (min)", "TRQ_max": "Torque (max)", "TRQ_range": "Torque (range)",
+    "SPP_mean": "Pressure (avg)", "SPP_std": "Pressure (vol)", "SPP_trend": "Pressure (trend)",
+    "SPP_min": "Press (min)", "SPP_max": "Press (max)", "SPP_range": "Press (range)",
+    "ROP_mean": "ROP (avg)", "ROP_std": "ROP (vol)", "ROP_trend": "ROP (trend)",
+    "ROP_min": "ROP (min)", "ROP_max": "ROP (max)", "ROP_range": "ROP (range)",
+    "WOB_mean": "WOB (avg)", "WOB_std": "WOB (vol)",
+    "FLOW_IN_mean": "Flow (avg)", "FLOW_IN_trend": "Flow (trend)",
+    "DH_TRQ_mean": "DH Torque (avg)", "DH_TRQ_trend": "DH Torque (trend)",
+    "DIFF_P_mean": "Diff Press (avg)",
     "TRQ_ROP_ratio": "Torque/ROP", "MSE_x_RPM": "MSE×RPM",
     "DH_TRQ_diff": "DH Torque Diff", "Flow_pressure_ratio": "Flow/Press",
     "WOB_TRQ_ratio": "WOB/Torque",
-    "MWD_INC": "Inclination", "INC_HIGH_ANGLE": "High Angle (>30°)",
-    "INC_CRITICAL": "Critical Angle (>60°)", "INC_x_TRQ": "Inc × Torque",
-    "INC_x_MSE": "Inc × MSE",
+    "HOOKLOAD_mean": "Hookload (avg)", "HOOKLOAD_trend": "Hookload (trend)",
+    "HOOKLOAD_cv": "Hookload CV",
+    "MWD_INC_mean": "Inclination (avg)", "MWD_INC_max": "Inclination (max)",
+    "INC_HIGH_ANGLE_frac": "High Angle %", "INC_CRITICAL_frac": "Critical Angle %",
+    "INC_x_TRQ": "Inc × Torque", "INC_x_MSE": "Inc × MSE",
+    "PIT_GL_abs_sum": "Pit G/L (sum)", "PIT_GL_abs_max": "Pit G/L (max)",
+    "FLOW_RATIO_mean": "Flow Ratio", "FLOW_IMBALANCE_mean": "Flow Imbalance",
+    "GAS_max": "Gas (max)", "GAS_trend": "Gas (trend)",
+    "BLOCK_VEL_mean": "Block Vel (avg)", "BLOCK_VEL_abs_mean": "Block |Vel|",
+    "ON_BOTTOM_frac": "On-Bottom %", "RPM_mean": "RPM (avg)",
 }
 
 # ---------------------------------------------------------------------------
