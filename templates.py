@@ -1,183 +1,125 @@
 """
-HTML Templates for the Drilling Advisory Dashboard
-====================================================
-Keeps all HTML generation out of app.py for readability.
-Each function returns an HTML string ready for st.markdown().
+HTML Templates — Simplified Drilling Advisory Dashboard
+=========================================================
+Focused on one clear answer: "Will a wiper trip be needed?"
 """
 
 
-# ---------------------------------------------------------------------------
-# Top Status Bar
-# ---------------------------------------------------------------------------
-def top_bar(depth: float, time_str: str, mode: str, risk: float,
-            level: str, risk_class: str) -> str:
+def prediction_hero(risk: float, level: str, recommendation: str,
+                    probability_pct: float) -> str:
+    """The big hero section showing the prediction answer."""
+    level_lower = level.lower()
+
+    if level_lower == "high":
+        answer = "LIKELY YES"
+        prob_color = "#ef4444"
+    elif level_lower == "moderate":
+        answer = "POSSIBLY"
+        prob_color = "#f59e0b"
+    else:
+        answer = "UNLIKELY"
+        prob_color = "#22c55e"
+
     return (
-        '<div class="top-bar">'
-        '<div class="top-bar-item">'
-        '  <div class="top-bar-label">Well</div>'
-        '  <div class="top-bar-value">16A(78)-32</div>'
-        '</div>'
-        '<div class="top-bar-item">'
-        '  <div class="top-bar-label">Rig</div>'
-        '  <div class="top-bar-value">Demo Rig-01</div>'
-        '</div>'
-        '<div class="top-bar-item">'
-        '  <div class="top-bar-label">Depth TVD</div>'
-        f'  <div class="top-bar-value">{depth:,.1f}'
-        '    <span style="font-size:12px;color:#64748b;">m</span>'
+        f'<div class="prediction-hero prediction-hero-{level_lower}">'
+        '  <div class="prediction-question">'
+        '    Will a wiper trip be needed in the next 4 hours?'
+        '  </div>'
+        f'  <div class="prediction-answer prediction-answer-{level_lower}">'
+        f'    {answer}'
+        '  </div>'
+        f'  <div class="prediction-probability" style="color:{prob_color};">'
+        f'    Probability: {probability_pct:.0f}%'
+        '  </div>'
+        f'  <div class="prediction-recommendation prediction-rec-{level_lower}">'
+        f'    ⟶ {recommendation}'
         '  </div>'
         '</div>'
-        '<div class="top-bar-item">'
-        '  <div class="top-bar-label">Time</div>'
-        f'  <div class="top-bar-value" style="font-size:14px;">{time_str}</div>'
-        '</div>'
-        '<div class="top-bar-item">'
-        '  <div class="top-bar-label">Status</div>'
-        '  <div class="top-bar-value" style="color:#22c55e;">DRILLING</div>'
-        '</div>'
-        '<div class="top-bar-item">'
-        '  <div class="top-bar-label">Model</div>'
-        '  <div class="top-bar-value" style="font-size:14px;color:#38bdf8;">'
-        '    GBT + IF Ensemble</div>'
-        '</div>'
-        '<div class="top-bar-item">'
-        '  <div class="top-bar-label">4-Hour Wiper Trip Prediction</div>'
-        f'  <div class="risk-badge {risk_class}">{risk:.2f} — {level}</div>'
-        '</div>'
-        '</div>'
     )
 
 
-# ---------------------------------------------------------------------------
-# Metric Card
-# ---------------------------------------------------------------------------
-def metric_card(label: str, value: float, unit: str,
-                arrow: str, trend_color: str) -> str:
+def context_bar(depth: float, time_str: str, mode: str) -> str:
+    """Compact context bar showing well info."""
     return (
-        '<div class="metric-card">'
-        f'  <div class="metric-label">{label}</div>'
-        f'  <div>'
-        f'    <span class="metric-value">{value:,.1f}</span>'
-        f'    <span class="metric-unit">{unit}</span>'
-        f'    <span class="metric-trend" style="color:{trend_color};">'
-        f'      {arrow}</span>'
-        f'  </div>'
+        '<div class="context-bar">'
+        '  <div class="context-item">'
+        '    <div class="context-label">Well</div>'
+        '    <div class="context-value">16A(78)-32</div>'
+        '  </div>'
+        '  <div class="context-item">'
+        '    <div class="context-label">Depth TVD</div>'
+        f'    <div class="context-value">{depth:,.0f} m</div>'
+        '  </div>'
+        '  <div class="context-item">'
+        '    <div class="context-label">Time</div>'
+        f'    <div class="context-value">{time_str}</div>'
+        '  </div>'
+        '  <div class="context-item">'
+        '    <div class="context-label">Mode</div>'
+        f'    <div class="context-value">{mode}</div>'
+        '  </div>'
         '</div>'
     )
 
 
-# ---------------------------------------------------------------------------
-# Advisory Panel
-# ---------------------------------------------------------------------------
-_REC_BG = {
-    "HIGH":     "rgba(239,68,68,0.15)",
-    "MODERATE": "rgba(245,158,11,0.15)",
-    "LOW":      "rgba(34,197,94,0.15)",
-}
+def why_panel(advisory: dict) -> str:
+    """Plain English explanation of why the prediction is what it is."""
+    level = advisory.get("level", "LOW")
 
+    # Build reasons HTML
+    reasons_html = ""
+    for reason in advisory["reasons"]:
+        if level == "HIGH":
+            cls = "why-reason why-reason-critical"
+        elif level == "MODERATE":
+            cls = "why-reason why-reason-warning"
+        else:
+            cls = "why-reason why-reason-ok"
+        reasons_html += f'<div class="{cls}">{reason}</div>'
 
-def advisory_panel(level: str, advisory: dict) -> str:
-    rec_bg = _REC_BG.get(level, "#1e293b")
-    color = advisory["color"]
+    # Build actions HTML
+    actions_html = ""
+    for i, action in enumerate(advisory["actions"], 1):
+        actions_html += f'<div class="why-action">{i}. {action}</div>'
 
-    reasons = "".join(
-        f'<div class="advisory-reason">{r}</div>' for r in advisory["reasons"]
-    )
-    actions = "".join(
-        f'<div class="advisory-action">{i}. {a}</div>'
-        for i, a in enumerate(advisory["actions"], 1)
-    )
-    conf_pct = advisory["confidence"] * 100
+    interpretation = advisory.get("interpretation", "")
 
     return (
-        '<div class="advisory-panel">'
-        '  <div class="advisory-header">Recommendation</div>'
-        f'  <div class="advisory-rec" style="background:{rec_bg};'
-        f'    color:{color}; border:1px solid {color};">'
-        f'    {advisory["recommendation"]}</div>'
-        '  <div class="advisory-section-title">Analysis</div>'
-        f'  {reasons}'
-        f'  <div class="advisory-interpretation">'
-        f'    {advisory["interpretation"]}</div>'
-        '  <div class="advisory-section-title">Recommended Actions</div>'
-        f'  {actions}'
-        '  <div class="advisory-section-title">Confidence</div>'
-        f'  <div class="confidence-bar-container">'
-        f'    <div class="confidence-bar"'
-        f'         style="width:{conf_pct}%;background:{color};"></div></div>'
-        f'  <div class="confidence-label">{advisory["confidence"]:.2f}</div>'
+        '<div class="why-panel">'
+        '  <div class="why-title">Why?</div>'
+        f'  {reasons_html}'
+        f'  <div style="font-size:13px;color:#64748b;font-style:italic;'
+        f'    margin:12px 0;padding:10px;background:#1a1f35;border-radius:6px;">'
+        f'    {interpretation}'
+        '  </div>'
+        '  <div class="why-title" style="margin-top:16px;">Recommended Actions</div>'
+        f'  {actions_html}'
         '</div>'
     )
 
 
-# ---------------------------------------------------------------------------
-# ML Model Output Panel
-# ---------------------------------------------------------------------------
-def _score_color(score: float) -> str:
-    if score > 0.7:
-        return "#ef4444"
-    elif score > 0.4:
-        return "#f59e0b"
-    return "#22c55e"
-
-
-def model_scores(rf_prob: float, if_score: float,
-                 risk: float, risk_color: str) -> str:
-    rf_c = _score_color(rf_prob)
-    if_c = _score_color(if_score)
-    return (
-        '<div class="model-panel">'
-        '  <div class="model-score-row">'
-        '    <span class="model-score-label">Calibrated GBT Prob.</span>'
-        f'    <span class="model-score-value" style="color:{rf_c};">'
-        f'      {rf_prob:.3f}</span></div>'
-        '  <div class="model-score-row">'
-        '    <span class="model-score-label">Isolation Forest Score</span>'
-        f'    <span class="model-score-value" style="color:{if_c};">'
-        f'      {if_score:.3f}</span></div>'
-        '  <div class="model-score-row"'
-        '       style="border-top:1px solid #334155;padding-top:8px;">'
-        '    <span class="model-score-label">4h Prediction (0.65 GBT + 0.35 IF)</span>'
-        f'    <span class="model-score-value" style="color:{risk_color};">'
-        f'      {risk:.3f}</span></div>'
-        '</div>'
-    )
-
-
-# ---------------------------------------------------------------------------
-# Model Information Panel
-# ---------------------------------------------------------------------------
-def model_info(metrics: dict) -> str:
-    model_type = metrics.get("model_type", "Calibrated GBT + IF")
-    label_src = metrics.get("label_source", "No Events")
-    n_events = metrics.get("n_reactive_events", 0)
-    label_display = f"{label_src} ({n_events} events)" if n_events else label_src
-    label_color = "#22c55e" if "Report" in label_src else "#f59e0b"
-    horizon = metrics.get("prediction_horizon_hrs", 4)
-    win_min = metrics.get("window_minutes", 30)
-    split_type = metrics.get("split_type", "Temporal")
-
+def model_info_compact(metrics: dict) -> str:
+    """Compact model info for the expander."""
     rows = [
-        ("Model Type",       model_type, None),
-        ("Label Source",     label_display, label_color),
-        ("Prediction Horizon", f"{horizon}h ahead", "#38bdf8"),
-        ("Window Size",      f"{win_min} min", None),
-        ("Train/Test Split", split_type, None),
-        ("Features",         str(metrics.get("n_features", "—")), None),
-        ("Train Windows",    f'{metrics.get("n_train", 0):,}', None),
-        ("Test Windows",     f'{metrics.get("n_test", 0):,}', None),
-        ("AUC-ROC",          f'{metrics.get("auc_roc", 0):.4f}', "#22c55e"),
-        ("Precision",        f'{metrics.get("precision", 0):.3f}', None),
-        ("Recall",           f'{metrics.get("recall", 0):.3f}', None),
-        ("F1-Score",         f'{metrics.get("f1_score", 0):.3f}', None),
+        ("Model", metrics.get("model_type", "—")),
+        ("Labels From", metrics.get("label_source", "—")),
+        ("Prediction", f'{metrics.get("prediction_horizon_hrs", 4)}h ahead'),
+        ("Window", f'{metrics.get("window_minutes", 30)} min'),
+        ("Split", metrics.get("split_type", "—")),
+        ("Features", str(metrics.get("n_features", "—"))),
+        ("Train / Test", f'{metrics.get("n_train", 0):,} / {metrics.get("n_test", 0):,}'),
+        ("AUC-ROC", f'{metrics.get("auc_roc", 0):.4f}'),
+        ("Precision", f'{metrics.get("precision", 0):.3f}'),
+        ("Recall", f'{metrics.get("recall", 0):.3f}'),
+        ("F1", f'{metrics.get("f1_score", 0):.3f}'),
     ]
-    html = '<div class="model-panel">'
-    for label, value, color in rows:
-        style = f' style="color:{color};"' if color else ""
+
+    html = '<div class="model-compact">'
+    for label, value in rows:
         html += (
-            '<div class="model-stat">'
-            f'  <span class="model-stat-label">{label}</span>'
-            f'  <span class="model-stat-value"{style}>{value}</span>'
+            '<div class="model-compact-row">'
+            f'  <span class="model-compact-label">{label}</span>'
+            f'  <span class="model-compact-value">{value}</span>'
             '</div>'
         )
     html += '</div>'
@@ -185,33 +127,12 @@ def model_info(metrics: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Event Log
-# ---------------------------------------------------------------------------
-def event_log(events: list[dict]) -> str:
-    if not events:
-        return (
-            '<div class="event-log"><div class="event-entry">'
-            '<span class="event-info">'
-            'Monitoring active — no threshold crossings detected'
-            '</span></div></div>'
-        )
-
-    html = '<div class="event-log">'
-    for evt in events[:20]:
-        sev = f"event-{evt['severity']}"
-        html += (
-            f'<div class="event-entry">'
-            f'  <span class="event-time">[{evt["time"]}]</span>'
-            f'  <span class="{sev}">{evt["message"]}</span>'
-            f'</div>'
-        )
-    html += '</div>'
-    return html
-
-
-# ---------------------------------------------------------------------------
-# Section Title
+# Section Title (reused)
 # ---------------------------------------------------------------------------
 def section_title(text: str, margin_top: int = 0) -> str:
     style = f' style="margin-top:{margin_top}px;"' if margin_top else ""
-    return f'<div class="section-title"{style}>{text}</div>'
+    return (
+        f'<div style="font-size:12px;color:#64748b;text-transform:uppercase;'
+        f'letter-spacing:1px;font-weight:600;margin-bottom:10px;'
+        f'padding-bottom:6px;border-bottom:1px solid #1e293b;"{style}>{text}</div>'
+    )

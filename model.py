@@ -340,14 +340,16 @@ class WiperTripPredictor:
         windows_df = create_windows(df, WINDOW_MINUTES)
         self._windows_df = windows_df
 
-        # 2. Get event timeline
+        # 2. Get event timeline — try reactive only first, fall back to all
         try:
             from report_parser import build_event_timeline
             events = build_event_timeline(df, reactive_only=True)
             n_events = len(events)
+            label_source = "Report-Mined (Reactive)"
         except Exception:
             events = []
             n_events = 0
+            label_source = "No Events Found"
 
         # 3. Create labels
         labels = create_labels(windows_df, events, PREDICTION_HORIZON_HOURS)
@@ -356,6 +358,41 @@ class WiperTripPredictor:
         valid_mask = labels != -1
         windows_valid = windows_df[valid_mask].reset_index(drop=True)
         labels_valid = labels[valid_mask].reset_index(drop=True)
+
+        # Check: do we have enough positives for the temporal split?
+        # With temporal split, positives in training (first 80%) may be zero
+        n_total = len(labels_valid)
+        split_idx = int(n_total * 0.8)
+        n_pos_train = int(labels_valid.iloc[:split_idx].sum()) if split_idx > 0 else 0
+
+        # Fallback: if reactive-only gives <2 positive training samples,
+        # include ALL events (including planned trip_out / POOH)
+        if n_pos_train < 2 and n_events > 0:
+            try:
+                from report_parser import build_event_timeline
+                events = build_event_timeline(df, reactive_only=False)
+                n_events = len(events)
+                label_source = "Report-Mined (All Events)"
+            except Exception:
+                pass
+
+            labels = create_labels(windows_df, events, PREDICTION_HORIZON_HOURS)
+            valid_mask = labels != -1
+            windows_valid = windows_df[valid_mask].reset_index(drop=True)
+            labels_valid = labels[valid_mask].reset_index(drop=True)
+            n_total = len(labels_valid)
+            split_idx = int(n_total * 0.8)
+            n_pos_train = int(labels_valid.iloc[:split_idx].sum()) if split_idx > 0 else 0
+
+        # If STILL <2 positives, try a wider prediction horizon (8h)
+        if n_pos_train < 2 and n_events > 0:
+            labels = create_labels(windows_df, events, PREDICTION_HORIZON_HOURS * 2)
+            valid_mask = labels != -1
+            windows_valid = windows_df[valid_mask].reset_index(drop=True)
+            labels_valid = labels[valid_mask].reset_index(drop=True)
+            n_total = len(labels_valid)
+            split_idx = int(n_total * 0.8)
+            n_pos_train = int(labels_valid.iloc[:split_idx].sum()) if split_idx > 0 else 0
 
         # Get feature columns
         feat_cols = self._get_feature_columns(windows_valid)
@@ -368,8 +405,6 @@ class WiperTripPredictor:
         X_all = np.nan_to_num(X_all, nan=0.0, posinf=0.0, neginf=0.0)
 
         # 5. TEMPORAL split — first 80% train, last 20% test
-        n_total = len(X_all)
-        split_idx = int(n_total * 0.8)
         X_train, X_test = X_all[:split_idx], X_all[split_idx:]
         y_train, y_test = y_all[:split_idx], y_all[split_idx:]
 
@@ -378,28 +413,35 @@ class WiperTripPredictor:
         X_test_scaled = self.scaler.transform(X_test)
 
         # 6. Train GBT with calibration
-        n_pos = y_train.sum()
-        if n_pos >= 5 and (y_train == 0).sum() >= 5:
+        n_pos = int(y_train.sum())
+        n_neg = int((y_train == 0).sum())
+        can_train = n_pos >= 2 and n_neg >= 2
+
+        if can_train and n_pos >= 5 and n_neg >= 5:
             # Enough positive samples for calibration
             try:
                 self.gbt_model = CalibratedClassifierCV(
-                    self._base_gbt, cv=3, method="sigmoid"
+                    self._base_gbt, cv=min(3, n_pos), method="sigmoid"
                 )
                 self.gbt_model.fit(X_train_scaled, y_train)
             except Exception:
                 # Fallback: train without calibration
                 self._base_gbt.fit(X_train_scaled, y_train)
                 self.gbt_model = self._base_gbt
-        else:
-            # Too few positive samples — train uncalibrated
+        elif can_train:
+            # Enough to train but not calibrate
             self._base_gbt.fit(X_train_scaled, y_train)
             self.gbt_model = self._base_gbt
+        else:
+            # Cannot train — will use rule-based fallback
+            self.gbt_model = None
+            label_source = f"Insufficient labels ({n_pos} pos in train)"
 
         # 7. Train Isolation Forest on TRAINING data only (no test leakage)
         self.if_model.fit(X_train_scaled)
 
         # 8. Evaluate on temporally-separated test set
-        if len(X_test) > 0 and len(np.unique(y_test)) > 1:
+        if self.gbt_model is not None and len(X_test) > 0 and len(np.unique(y_test)) > 1:
             y_pred = self.gbt_model.predict(X_test_scaled)
             y_proba = self.gbt_model.predict_proba(X_test_scaled)[:, 1]
             try:
@@ -414,9 +456,7 @@ class WiperTripPredictor:
             report = {}
             y_pred = np.array([])
 
-        self.is_trained = True
-
-        label_source = "Report-Mined (Reactive)" if n_events > 0 else "No Events Found"
+        self.is_trained = self.gbt_model is not None
 
         self.training_metrics = {
             "n_total_windows": len(windows_df),
