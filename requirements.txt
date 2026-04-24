@@ -4,3 +4,9 @@ plotly
 numpy
 scikit-learn
 pymupdf
+langchain
+langchain-ollama
+langchain-community
+langgraph
+chromadb
+sentence-transformers

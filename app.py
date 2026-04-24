@@ -28,6 +28,7 @@ from engine import (
 )
 from model import WiperTripPredictor
 import templates as T
+from advisor_chat import render_advisor_chat
 
 # ---------------------------------------------------------------------------
 # Page Config
@@ -375,3 +376,8 @@ else:
             'Press ▶ START to begin real-time streaming</div>',
             unsafe_allow_html=True,
         )
+
+# ---------------------------------------------------------------------------
+# AI Drilling Advisor Chat (below dashboard)
+# ---------------------------------------------------------------------------
+render_advisor_chat(df)
