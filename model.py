@@ -14,7 +14,7 @@ import pandas as pd
 from sklearn.ensemble import GradientBoostingClassifier, IsolationForest
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
 import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -182,21 +182,55 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 # Label Generation (Real + Pseudo)
 # ---------------------------------------------------------------------------
 
-def generate_labels(df: pd.DataFrame, feat: pd.DataFrame) -> pd.Series:
-    """Generate wiper trip risk labels using real report data + pseudo-labels.
+def _get_dataset_trip_needed_labels(df: pd.DataFrame) -> pd.Series | None:
+    """Return dataset-native trip-needed labels when present."""
+    candidates = ["label", "LABEL", "target", "TARGET", "y", "trip_label"]
+    for col in candidates:
+        if col in df.columns:
+            vals = pd.to_numeric(df[col], errors="coerce").fillna(0).clip(lower=0, upper=1)
+            return vals.astype(int)
+    return None
+
+def generate_labels(df: pd.DataFrame, feat: pd.DataFrame) -> tuple[pd.Series, pd.Series, dict]:
+    """Generate labels and PU-style sample weights.
 
     Priority:
-    1. Real labels from daily drilling reports (if available)
-    2. Pseudo-labels from domain heuristics (fallback / supplement)
+    1. Dataset-native trip-needed labels (if available)
+    2. Report-mined labels
+    3. Pseudo-labels from domain heuristics (fallback)
+
+    PU refinement:
+    - Positives remain labeled (trusted)
+    - Non-positives treated as unlabeled
+    - Reliable negatives mined from low-risk unlabeled region
+    - Ambiguous unlabeled kept with very low weight
     """
-    # --- Try real labels from reports ---
-    try:
-        from report_parser import build_label_series
-        real_labels = build_label_series(df)
+    label_source_hint = "Pseudo-Labels"
+
+    # --- Preferred: dataset-native trip-needed labels ---
+    ds_labels = _get_dataset_trip_needed_labels(df)
+    if ds_labels is not None and int(ds_labels.sum()) > 0:
+        real_labels = ds_labels
+        real_conf = pd.Series(np.where(real_labels == 1, 1.0, 0.0), index=df.index)
+        event_profiles = []
         n_real = int(real_labels.sum())
-    except Exception:
-        real_labels = pd.Series(0, index=df.index, dtype=int)
-        n_real = 0
+        label_source_hint = "Dataset-Labeled"
+    else:
+        # --- Fallback: report-mined labels ---
+        try:
+            from report_parser import build_label_bundle
+            bundle = build_label_bundle(df)
+            real_labels = bundle["labels"]
+            real_conf = bundle["confidence"]
+            event_profiles = bundle.get("event_profiles", [])
+            n_real = int(real_labels.sum())
+            if n_real > 0:
+                label_source_hint = "Report-Mined"
+        except Exception:
+            real_labels = pd.Series(0, index=df.index, dtype=int)
+            real_conf = pd.Series(0.0, index=df.index, dtype=float)
+            event_profiles = []
+            n_real = 0
 
     # --- Pseudo-labels from domain rules ---
     mse = feat["MSE"]
@@ -236,19 +270,140 @@ def generate_labels(df: pd.DataFrame, feat: pd.DataFrame) -> pd.Series:
         + 0.09 * pit_gl_signal
     )
     pseudo_labels = (pseudo_score > 0.30).astype(int)
+    pseudo_conf = np.clip((pseudo_score - 0.30) / 0.50, 0.0, 1.0)
+
+    # Base negative weighting:
+    # very low pseudo-score -> stronger negative, elevated pseudo-score -> soft negative.
+    sample_weight = pd.Series(0.65, index=df.index, dtype=float)
+    sample_weight.loc[pseudo_score < 0.15] = 0.85
+    sample_weight.loc[pseudo_score > 0.45] = 0.35
 
     # --- Blend: real labels dominate ---
     if n_real > 50:
         # Real labels available — use them as primary, pseudo as supplement
         labels = real_labels.copy()
+        real_pos_weight = 0.40 + 0.90 * real_conf
+        sample_weight.loc[real_labels == 1] = real_pos_weight.loc[real_labels == 1].clip(0.30, 1.50)
+
         # Add pseudo-labeled high-confidence points not covered by reports
         supplement_mask = (pseudo_labels == 1) & (real_labels == 0) & (pseudo_score > 0.5)
         labels.loc[supplement_mask] = 1
+        supplement_weight = 0.45 + 0.70 * pseudo_conf
+        sample_weight.loc[supplement_mask] = supplement_weight.loc[supplement_mask].clip(0.40, 1.20)
     else:
         # No real labels — fall back to pseudo-labels
         labels = pseudo_labels
+        pseudo_pos_weight = 0.45 + 0.70 * pseudo_conf
+        sample_weight.loc[labels == 1] = pseudo_pos_weight.loc[labels == 1].clip(0.35, 1.15)
 
-    return labels
+    # -------------------------------------------------------------------
+    # PU refinement:
+    # 1) Keep positive rows labeled.
+    # 2) Treat non-positive rows as unlabeled.
+    # 3) Mine reliable negatives from lowest-risk unlabeled region.
+    # 4) Keep remaining unlabeled rows with tiny weight (ambiguous).
+    # -------------------------------------------------------------------
+    positive_mask = labels == 1
+    unlabeled_mask = labels == 0
+
+    pu_rn_quantile = 0.20
+    reliable_negative_mask = pd.Series(False, index=df.index)
+    if int(unlabeled_mask.sum()) > 0:
+        unlabeled_scores = pseudo_score.loc[unlabeled_mask]
+        rn_cut = float(unlabeled_scores.quantile(pu_rn_quantile))
+        reliable_negative_mask = unlabeled_mask & (pseudo_score <= rn_cut)
+
+        # Ensure we always have a usable negative class for training.
+        if int(reliable_negative_mask.sum()) < 50:
+            fallback_n = min(max(50, int(0.10 * int(unlabeled_mask.sum()))), int(unlabeled_mask.sum()))
+            low_idx = unlabeled_scores.nsmallest(fallback_n).index
+            reliable_negative_mask.loc[low_idx] = True
+
+    pu_labels = pd.Series(0, index=df.index, dtype=int)
+    pu_labels.loc[positive_mask] = 1
+
+    pu_weights = pd.Series(0.08, index=df.index, dtype=float)  # ambiguous unlabeled
+    pu_weights.loc[reliable_negative_mask] = 0.90
+    pu_weights.loc[positive_mask] = sample_weight.loc[positive_mask].clip(0.80, 1.60)
+
+    labels = pu_labels
+    sample_weight = pu_weights
+
+    label_meta = {
+        "n_real_positive": n_real,
+        "n_weighted_positive": int(labels.sum()),
+        "avg_positive_weight": float(sample_weight.loc[labels == 1].mean()) if int(labels.sum()) > 0 else 0.0,
+        "avg_negative_weight": float(sample_weight.loc[labels == 0].mean()) if int((labels == 0).sum()) > 0 else 0.0,
+        "label_source_hint": label_source_hint,
+        "pu_positive_count": int(positive_mask.sum()),
+        "pu_reliable_negative_count": int(reliable_negative_mask.sum()),
+        "pu_ambiguous_unlabeled_count": int((labels == 0).sum() - reliable_negative_mask.sum()),
+        "pu_rn_quantile": pu_rn_quantile,
+        "event_profile_counts": {
+            "reactive": int(sum(1 for e in event_profiles if e.get("profile") == "reactive")),
+            "scheduled": int(sum(1 for e in event_profiles if e.get("profile") == "scheduled")),
+            "ambiguous": int(sum(1 for e in event_profiles if e.get("profile") == "ambiguous")),
+            "high_conf": int(sum(1 for e in event_profiles if e.get("tier") == "high")),
+            "med_conf": int(sum(1 for e in event_profiles if e.get("tier") == "medium")),
+            "low_conf": int(sum(1 for e in event_profiles if e.get("tier") == "low")),
+        },
+    }
+
+    return labels.astype(int), sample_weight.astype(float), label_meta
+
+
+def _time_aware_split(
+    X: np.ndarray,
+    y: pd.Series,
+    sample_weight: pd.Series,
+    test_size: float = 0.2,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+    np.ndarray,
+    np.ndarray,
+    str,
+]:
+    """Split chronologically and fallback to stratified random split when needed."""
+    n = len(y)
+    split_idx = max(1, min(n - 1, int(n * (1 - test_size))))
+
+    y_train = y.iloc[:split_idx]
+    y_test = y.iloc[split_idx:]
+    if y_train.sum() > 0 and y_test.sum() > 0 and len(y_train) > 50 and len(y_test) > 20:
+        strategy = "Chronological 80/20"
+        idx_train = np.arange(0, split_idx)
+        idx_test = np.arange(split_idx, n)
+        return (
+            X[:split_idx],
+            X[split_idx:],
+            y_train,
+            y_test,
+            sample_weight.iloc[:split_idx],
+            sample_weight.iloc[split_idx:],
+            idx_train,
+            idx_test,
+            strategy,
+        )
+
+    # Fallback only when chronological split cannot represent both classes.
+    stratify_target = y if y.nunique() > 1 else None
+    all_idx = np.arange(n)
+    X_train, X_test, y_train, y_test, w_train, w_test, idx_train, idx_test = train_test_split(
+        X,
+        y,
+        sample_weight,
+        all_idx,
+        test_size=test_size,
+        random_state=42,
+        stratify=stratify_target,
+    )
+    strategy = "Stratified random fallback"
+    return X_train, X_test, y_train, y_test, w_train, w_test, idx_train, idx_test, strategy
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +432,10 @@ class WiperTripPredictor:
         self.feature_names = []
         self.is_trained = False
         self.training_metrics = {}
+        self.training_labels = pd.Series(dtype=int)
+        self.training_sample_weight = pd.Series(dtype=float)
+        self.train_indices = np.array([], dtype=int)
+        self.test_indices = np.array([], dtype=int)
 
     def train(self, df: pd.DataFrame) -> dict:
         """Train both models on the provided drilling data.
@@ -291,19 +450,19 @@ class WiperTripPredictor:
         feat = engineer_features(df)
         self.feature_names = list(feat.columns)
 
-        # Generate labels (real + pseudo)
-        labels = generate_labels(df, feat)
+        # Generate labels + confidence-derived sample weights.
+        labels, sample_weight, label_meta = generate_labels(df, feat)
 
         # Scale features
         X = self.scaler.fit_transform(feat)
 
-        # Train/test split for validation metrics
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, labels, test_size=0.2, random_state=42, stratify=labels
+        # Time-aware split for leakage-safe validation.
+        X_train, X_test, y_train, y_test, w_train, w_test, idx_train, idx_test, split_strategy = _time_aware_split(
+            X, labels, sample_weight, test_size=0.2
         )
 
         # Train Gradient Boosted Trees
-        self.gbt_model.fit(X_train, y_train)
+        self.gbt_model.fit(X_train, y_train, sample_weight=w_train)
 
         # Evaluate
         y_pred = self.gbt_model.predict(X_test)
@@ -315,24 +474,60 @@ class WiperTripPredictor:
             auc = 0.5
 
         report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
+        tn, fp, fn, tp = confusion_matrix(y_test, y_pred, labels=[0, 1]).ravel()
+
+        # Operational cadence from telemetry spacing.
+        if "Time" in df.columns:
+            dt_seconds = pd.to_datetime(df["Time"]).diff().dt.total_seconds().median()
+            dt_seconds = float(dt_seconds) if pd.notna(dt_seconds) and dt_seconds > 0 else 10.0
+        else:
+            dt_seconds = 10.0
+        rows_per_day = 86400.0 / dt_seconds
+        false_alerts_per_day = (fp / max(len(y_test), 1)) * rows_per_day
+
+        # Business-impact proxy assumptions (conservative defaults).
+        npt_hours_per_avoided_event = 0.75
+        rig_cost_per_hour = 12000.0
+        oil_bbl_per_hour = 18.0
+        oil_price_usd_per_bbl = 70.0
+        annual_model_program_cost = 180000.0
+
+        avoided_events_proxy = float(tp)
+        time_saved_hours = avoided_events_proxy * npt_hours_per_avoided_event
+        reduced_cost_usd = time_saved_hours * rig_cost_per_hour
+        extra_bbl_proxy = time_saved_hours * oil_bbl_per_hour
+        money_increase_proxy_usd = extra_bbl_proxy * oil_price_usd_per_bbl
+        total_benefit_proxy_usd = reduced_cost_usd + money_increase_proxy_usd
+        roi_proxy = total_benefit_proxy_usd / annual_model_program_cost
 
         # Train Isolation Forest on all data
         self.if_model.fit(X)
 
         self.is_trained = True
+        self.training_labels = labels.copy()
+        self.training_sample_weight = sample_weight.copy()
+        self.train_indices = np.array(idx_train, dtype=int)
+        self.test_indices = np.array(idx_test, dtype=int)
 
         # Label source info
-        try:
-            from report_parser import get_event_summary
-            evt_summary = get_event_summary()
-            n_report_events = evt_summary.get("n_events", 0)
-            label_source = "Report-Mined" if n_report_events > 50 else "Pseudo-Labels"
-        except Exception:
+        label_source = label_meta.get("label_source_hint", "Pseudo-Labels")
+        if label_source == "Report-Mined":
+            try:
+                from report_parser import get_event_summary
+                evt_summary = get_event_summary()
+                n_report_events = evt_summary.get("n_events", 0)
+            except Exception:
+                n_report_events = int((labels == 1).sum())
+        elif label_source == "Dataset-Labeled":
+            n_report_events = int((labels == 1).sum())
+        else:
             n_report_events = 0
-            label_source = "Pseudo-Labels"
 
+        profile_counts = label_meta.get("event_profile_counts", {})
         self.training_metrics = {
             "n_samples": len(df),
+            "n_train_samples": len(self.train_indices),
+            "n_test_samples": len(self.test_indices),
             "n_features": len(self.feature_names),
             "positive_rate": float(labels.mean()),
             "auc_roc": round(auc, 4),
@@ -342,7 +537,22 @@ class WiperTripPredictor:
             "accuracy": round(report.get("accuracy", 0), 3),
             "label_source": label_source,
             "n_report_events": n_report_events,
-            "model_type": "GBT + Isolation Forest",
+            "split_strategy": split_strategy,
+            "avg_positive_weight": round(label_meta.get("avg_positive_weight", 0.0), 3),
+            "avg_negative_weight": round(label_meta.get("avg_negative_weight", 0.0), 3),
+            "n_reactive_events": profile_counts.get("reactive", 0),
+            "n_scheduled_events": profile_counts.get("scheduled", 0),
+            "n_ambiguous_events": profile_counts.get("ambiguous", 0),
+            "pu_positive_count": label_meta.get("pu_positive_count", 0),
+            "pu_reliable_negative_count": label_meta.get("pu_reliable_negative_count", 0),
+            "pu_ambiguous_unlabeled_count": label_meta.get("pu_ambiguous_unlabeled_count", 0),
+            "pu_rn_quantile": label_meta.get("pu_rn_quantile", 0.2),
+            "false_alerts_per_day": round(float(false_alerts_per_day), 2),
+            "time_saved_hours_proxy": round(float(time_saved_hours), 1),
+            "reduced_cost_usd_proxy": round(float(reduced_cost_usd), 0),
+            "money_increase_usd_proxy": round(float(money_increase_proxy_usd), 0),
+            "roi_proxy": round(float(roi_proxy), 2),
+            "model_type": "GBT (PU-weighted) + Isolation Forest",
         }
 
         return self.training_metrics

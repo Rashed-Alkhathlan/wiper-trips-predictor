@@ -61,6 +61,19 @@ _COMPILED_PATTERNS = [
     for p, etype, weight in _EVENT_PATTERNS
 ]
 
+_REACTIVE_EVENT_TYPES = {
+    "tight_spot", "high_torque", "stuck_pipe", "pack_off", "overpull", "drag"
+}
+_SCHEDULED_EVENT_TYPES = {
+    "trip_out", "wiper_trip", "short_trip", "wash", "back_ream"
+}
+_SCHEDULED_TEXT_CUES = (
+    "planned", "schedule", "routine", "program", "circulate and condition"
+)
+_REACTIVE_TEXT_CUES = (
+    "high torque", "tight", "stuck", "pack off", "overpull", "drag", "unable"
+)
+
 
 # ---------------------------------------------------------------------------
 # Parse a single report
@@ -189,79 +202,178 @@ def parse_all_reports(report_dir: Optional[str] = None) -> list[dict]:
     return all_events
 
 
+def _safe_ratio(a: float, b: float) -> float:
+    """Return a stable ratio for anomaly calculations."""
+    if abs(b) < 1e-6:
+        return 1.0
+    return float(a) / float(b)
+
+
+def _event_text_profile(evt: dict) -> dict:
+    """Classify event as reactive/scheduled/ambiguous using type and text cues."""
+    event_type = evt.get("event_type", "")
+    desc = (evt.get("description") or "").lower()
+
+    reactive_hit = any(token in desc for token in _REACTIVE_TEXT_CUES)
+    scheduled_hit = any(token in desc for token in _SCHEDULED_TEXT_CUES)
+
+    if event_type in _REACTIVE_EVENT_TYPES or reactive_hit:
+        profile = "reactive"
+    elif event_type in _SCHEDULED_EVENT_TYPES or scheduled_hit:
+        profile = "scheduled"
+    else:
+        profile = "ambiguous"
+
+    has_precise_time = bool(evt.get("start_hour") and evt.get("end_hour"))
+    return {
+        "profile": profile,
+        "has_precise_time": has_precise_time,
+        "reactive_text_hit": reactive_hit,
+        "scheduled_text_hit": scheduled_hit,
+    }
+
+
+def _compute_precursor_score(df: pd.DataFrame, times: pd.Series, evt: dict) -> float:
+    """Estimate pre-event anomaly strength from operational signals."""
+    if not evt.get("start_hour"):
+        return 0.0
+
+    evt_start = datetime.combine(evt["date"], evt["start_hour"])
+    pre_mask = (times >= evt_start - timedelta(minutes=60)) & (times < evt_start)
+    base_mask = (times >= evt_start - timedelta(minutes=180)) & (times < evt_start - timedelta(minutes=60))
+
+    if pre_mask.sum() < 5 or base_mask.sum() < 5:
+        return 0.0
+
+    pre = df.loc[pre_mask]
+    base = df.loc[base_mask]
+
+    score = 0.0
+    trq_ratio = _safe_ratio(pre["TRQ"].mean(), base["TRQ"].mean())
+    spp_ratio = _safe_ratio(pre["SPP"].mean(), base["SPP"].mean())
+    rop_ratio = _safe_ratio(pre["ROP"].mean(), base["ROP"].mean())
+
+    score += max(0.0, min(1.0, (trq_ratio - 1.0) / 0.35)) * 0.4
+    score += max(0.0, min(1.0, (spp_ratio - 1.0) / 0.35)) * 0.3
+    score += max(0.0, min(1.0, (1.0 - rop_ratio) / 0.35)) * 0.3
+
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def _event_confidence(evt: dict, precursor_score: float) -> dict:
+    """Compute event confidence and tier for weighted supervision."""
+    profile = _event_text_profile(evt)
+    base_weight = float(evt.get("weight", 0.7))
+
+    # Convert report pattern severity to a baseline confidence range.
+    conf = 0.35 + 0.45 * np.clip((base_weight - 0.6) / 0.4, 0.0, 1.0)
+    if profile["has_precise_time"]:
+        conf += 0.08
+    conf += 0.30 * precursor_score
+
+    if profile["profile"] == "reactive":
+        conf += 0.10
+    elif profile["profile"] == "scheduled":
+        conf -= 0.12
+
+    conf = float(np.clip(conf, 0.15, 1.0))
+    if conf >= 0.75:
+        tier = "high"
+    elif conf >= 0.5:
+        tier = "medium"
+    else:
+        tier = "low"
+
+    return {
+        "confidence": conf,
+        "tier": tier,
+        "profile": profile["profile"],
+        "has_precise_time": profile["has_precise_time"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Build label series aligned to a DataFrame
 # ---------------------------------------------------------------------------
-def build_label_series(df: pd.DataFrame) -> pd.Series:
-    """Build a binary label series (0/1) for the drilling DataFrame.
+def build_label_bundle(df: pd.DataFrame) -> dict:
+    """Build binary labels plus per-sample confidence for the DataFrame.
 
-    Maps report-mined events onto the time-series data by matching
-    report dates. For each report date with events, a time window
-    around the event is labeled as 1 (high risk).
-
-    If no report PDFs are available, returns all zeros.
-
-    Args:
-        df: DataFrame with a 'Time' column (datetime).
-
-    Returns:
-        pd.Series of int labels (0 or 1), same index as df.
+    Returns a dict with:
+        labels: binary series (0/1)
+        confidence: confidence for positive windows (0..1)
+        event_profiles: event-level confidence metadata
     """
     labels = pd.Series(0, index=df.index, dtype=int)
-    events = parse_all_reports() 
+    confidence = pd.Series(0.0, index=df.index, dtype=float)
+    events = parse_all_reports()
+    event_profiles = []
 
     if not events:
-        return labels
+        return {
+            "labels": labels,
+            "confidence": confidence,
+            "event_profiles": event_profiles,
+        }
 
-    # Ensure Time column is datetime
     times = pd.to_datetime(df["Time"] if "Time" in df.columns else df.index)
 
     for evt in events:
         evt_date = evt["date"]
         weight = evt["weight"]
 
-        # Only label high-confidence events
         if weight < 0.7:
             continue
 
-        # Find rows matching this report date
-        date_mask = times.dt.date == evt_date
+        precursor = _compute_precursor_score(df, times, evt)
+        conf_meta = _event_confidence(evt, precursor)
+        evt_conf = conf_meta["confidence"]
 
         if evt["start_hour"] and evt["end_hour"]:
-            # Precise time window from the report
             start_dt = datetime.combine(evt_date, evt["start_hour"])
             end_dt = datetime.combine(evt_date, evt["end_hour"])
-
-            # Handle overnight (e.g. 22:00 → 02:00)
             if end_dt <= start_dt:
                 end_dt += timedelta(days=1)
 
-            # Expand window by 30 min on each side (early warning)
             start_dt -= timedelta(minutes=30)
             end_dt += timedelta(minutes=30)
-
-            time_mask = (times >= start_dt) & (times <= end_dt)
-            labels.loc[time_mask] = 1
+            event_mask = (times >= start_dt) & (times <= end_dt)
+            labels.loc[event_mask] = 1
+            confidence.loc[event_mask] = np.maximum(confidence.loc[event_mask], evt_conf)
         else:
-            # No precise time — label a 4-hour window around midday
-            # (avoids labeling entire 24h which inflates positive rate)
             mid = datetime.combine(evt_date, datetime.strptime("12:00", "%H:%M").time())
             fallback_start = mid - timedelta(hours=2)
             fallback_end = mid + timedelta(hours=2)
-            time_mask = (times >= fallback_start) & (times <= fallback_end)
-            labels.loc[time_mask] = 1
+            event_mask = (times >= fallback_start) & (times <= fallback_end)
+            labels.loc[event_mask] = 1
+            confidence.loc[event_mask] = np.maximum(confidence.loc[event_mask], evt_conf * 0.85)
 
-        # Also label a 2-hour "approach window" before the event
-        # (the model should learn to predict risk BEFORE the event)
         if evt["start_hour"]:
-            approach_start = datetime.combine(
-                evt_date, evt["start_hour"]
-            ) - timedelta(hours=2)
+            approach_start = datetime.combine(evt_date, evt["start_hour"]) - timedelta(hours=2)
             approach_end = datetime.combine(evt_date, evt["start_hour"])
             approach_mask = (times >= approach_start) & (times <= approach_end)
             labels.loc[approach_mask] = 1
+            confidence.loc[approach_mask] = np.maximum(confidence.loc[approach_mask], evt_conf * 0.90)
 
-    return labels
+        event_profiles.append({
+            "date": evt_date,
+            "event_type": evt.get("event_type"),
+            "profile": conf_meta["profile"],
+            "tier": conf_meta["tier"],
+            "confidence": round(evt_conf, 3),
+            "precursor_score": round(float(precursor), 3),
+            "has_precise_time": conf_meta["has_precise_time"],
+        })
+
+    return {
+        "labels": labels,
+        "confidence": confidence,
+        "event_profiles": event_profiles,
+    }
+
+
+def build_label_series(df: pd.DataFrame) -> pd.Series:
+    """Build binary labels for training compatibility with existing code."""
+    return build_label_bundle(df)["labels"]
 
 
 # ---------------------------------------------------------------------------

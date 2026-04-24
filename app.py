@@ -71,12 +71,35 @@ def get_data():
 def get_trained_model(_df):
     predictor = WiperTripPredictor()
     metrics = predictor.train(_df)
-    return predictor, metrics
+    labels = predictor.training_labels.copy()
+    test_indices = predictor.test_indices.copy()
+    return predictor, metrics, labels, test_indices
+
+
+def _get_dataset_label_series(data: pd.DataFrame) -> tuple[pd.Series | None, str | None]:
+    """Return dataset-native label series if present."""
+    candidates = ["label", "LABEL", "target", "TARGET", "y", "trip_label"]
+    for col in candidates:
+        if col in data.columns:
+            series = pd.to_numeric(data[col], errors="coerce").fillna(0).clip(lower=0, upper=1)
+            return series.astype(int).reset_index(drop=True), col
+    return None, None
 
 
 df = get_data()
-with st.spinner("Training ML models (GBT + Isolation Forest) on real labels..."):
-    ml_model, training_metrics = get_trained_model(df)
+with st.spinner("Training ML models (GBT + Isolation Forest) on confidence-weighted labels..."):
+    ml_model, training_metrics, true_labels, test_indices = get_trained_model(df)
+
+dataset_labels, dataset_label_col = _get_dataset_label_series(df)
+label_source_text = "training label pipeline"
+if dataset_labels is not None and len(dataset_labels) == len(df):
+    true_labels = dataset_labels
+    label_source_text = f"dataset column '{dataset_label_col}'"
+
+if len(true_labels) != len(df):
+    true_labels = pd.Series(0, index=df.index, dtype=int)
+if test_indices is None or len(test_indices) == 0:
+    test_indices = np.arange(max(1, int(len(df) * 0.8)), len(df))
 
 # ---------------------------------------------------------------------------
 # Feature-name mapping for the importance chart
@@ -103,12 +126,28 @@ FEAT_NAME_MAP = {
 # Session State
 # ---------------------------------------------------------------------------
 DEFAULTS = {
-    "idx": 50, "running": False, "event_log": [],
-    "risk_history": {}, "risk_scores": [], "mode": "Auto",
+    "idx_pos": 0,
+    "running": False,
+    "event_log": [],
+    "risk_history": {},
+    "risk_scores": [],
+    "mode": "Auto",
+    "dataset_scope": "Full Dataset",
+    "show_label_compare": True,
+    "prev_dataset_scope": "Full Dataset",
 }
 for key, val in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = val
+
+
+def _get_active_indices(scope: str) -> np.ndarray:
+    """Return ordered index positions for selected data scope."""
+    if scope == "Test Set Only":
+        valid = [int(i) for i in np.array(test_indices).tolist() if 0 <= int(i) < len(df)]
+        if valid:
+            return np.array(sorted(set(valid)), dtype=int)
+    return np.arange(len(df), dtype=int)
 
 # ---------------------------------------------------------------------------
 # Controls — Top Row (never re-rendered during streaming)
@@ -128,22 +167,51 @@ with c5:
     if st.button("■ STOP", use_container_width=True):
         st.session_state.running = False
 
+d1, d2 = st.columns([2, 2])
+with d1:
+    scope = st.radio(
+        "Dataset Scope",
+        ["Full Dataset", "Test Set Only"],
+        horizontal=True,
+        key="dataset_scope",
+    )
+with d2:
+    st.session_state.show_label_compare = st.checkbox(
+        "Show True vs Soft Label",
+        value=st.session_state.show_label_compare,
+        help="Displays binary training label and model soft label for current timestep.",
+    )
+
+active_indices = _get_active_indices(scope)
+if len(active_indices) == 0:
+    active_indices = np.arange(len(df), dtype=int)
+
+if scope != st.session_state.prev_dataset_scope:
+    st.session_state.idx_pos = 0
+    st.session_state.running = False
+    st.session_state.risk_history = {}
+    st.session_state.risk_scores = []
+    st.session_state.prev_dataset_scope = scope
+
+if st.session_state.idx_pos >= len(active_indices):
+    st.session_state.idx_pos = max(0, len(active_indices) - 1)
+
 # Manual stepping (only shown when relevant)
 if st.session_state.mode == "Manual" and not st.session_state.running:
     s1, s2, s3 = st.columns([1, 6, 1])
     with s1:
         if st.button("STEP ▶", use_container_width=True):
-            st.session_state.idx = min(st.session_state.idx + 1, len(df) - 1)
+            st.session_state.idx_pos = min(st.session_state.idx_pos + 1, len(active_indices) - 1)
     with s3:
         if st.button("STEP x10 ▶▶", use_container_width=True):
-            st.session_state.idx = min(st.session_state.idx + 10, len(df) - 1)
+            st.session_state.idx_pos = min(st.session_state.idx_pos + 10, len(active_indices) - 1)
     with s2:
-        new_idx = st.slider(
-            "Data Position", 50, len(df) - 1,
-            st.session_state.idx, key="pos_slider",
+        new_pos = st.slider(
+            "Data Position", 0, len(active_indices) - 1,
+            st.session_state.idx_pos,
         )
-        if new_idx != st.session_state.idx:
-            st.session_state.idx = new_idx
+        if new_pos != st.session_state.idx_pos:
+            st.session_state.idx_pos = new_pos
             st.session_state.risk_history = {}
             st.session_state.risk_scores = []
 
@@ -213,7 +281,9 @@ def render_dashboard(idx: int):
         # ---- CENTER: Charts ----
         with center_col:
             st.markdown(T.section_title("Trend Charts"), unsafe_allow_html=True)
-            _render_charts(idx, window_size)
+            _render_charts(idx, window_size, show_true_label=st.session_state.show_label_compare)
+            if st.session_state.show_label_compare:
+                st.caption("Risk chart overlay: white dashed line = true label (1 near top, 0 near bottom).")
 
         # ---- RIGHT: Advisory + Model ----
         with right_col:
@@ -238,6 +308,20 @@ def render_dashboard(idx: int):
                 )
                 _render_importance_chart(feat_imp, idx)
 
+            if st.session_state.show_label_compare:
+                st.markdown(
+                    T.section_title("Label Comparison", margin_top=16),
+                    unsafe_allow_html=True,
+                )
+                true_val = int(true_labels.iloc[idx]) if 0 <= idx < len(true_labels) else 0
+                soft_val = float(rf_prob)
+                lc1, lc2 = st.columns(2)
+                with lc1:
+                    st.metric("True Label", f"{true_val:d}")
+                with lc2:
+                    st.metric("Model Soft Label", f"{soft_val:.3f}")
+                st.caption(f"True label source: {label_source_text}. Soft label is supervised probability.")
+
         # ---- Bottom Row ----
         bl, br = st.columns([3, 2])
         with bl:
@@ -256,7 +340,7 @@ def render_dashboard(idx: int):
 # ---------------------------------------------------------------------------
 # Chart Helpers
 # ---------------------------------------------------------------------------
-def _render_charts(idx: int, win: int):
+def _render_charts(idx: int, win: int, show_true_label: bool = False):
     """Build and display the 4-row Plotly trend chart."""
     start = max(0, idx - win)
     cd = df.iloc[start : idx + 1]
@@ -304,6 +388,43 @@ def _render_charts(idx: int, win: int):
                    fill="tozeroy", fillcolor="rgba(239,68,68,0.1)"),
         row=4, col=1,
     )
+
+    # Optional overlay for true labels to compare against model output.
+    if show_true_label and len(true_labels) == len(df):
+        true_window = pd.to_numeric(
+            true_labels.iloc[start : idx + 1], errors="coerce"
+        ).fillna(0).clip(lower=0, upper=1)
+        x_vals = np.array(x)
+        t_vals = true_window.to_numpy(dtype=float)
+
+        # Shift and scale so zeros are still visible above axis baseline.
+        y_true = t_vals * 0.88 + 0.06
+        fig.add_trace(
+            go.Scatter(
+                x=x_vals,
+                y=y_true,
+                mode="lines",
+                line=dict(color="#f8fafc", width=1.8, dash="dot"),
+                showlegend=False,
+            ),
+            row=4,
+            col=1,
+        )
+
+        pos_idx = np.where(t_vals > 0.5)[0]
+        if len(pos_idx) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=x_vals[pos_idx],
+                    y=np.full(len(pos_idx), 0.95),
+                    mode="markers",
+                    marker=dict(size=6, color="#f8fafc", symbol="diamond"),
+                    showlegend=False,
+                ),
+                row=4,
+                col=1,
+            )
+
     fig.add_hline(y=0.7, line_dash="dash", line_color="#ef4444", line_width=1,
                   row=4, col=1, annotation_text="HIGH",
                   annotation_position="right",
@@ -360,14 +481,14 @@ def _render_importance_chart(feat_imp: dict, idx: int):
 # ---------------------------------------------------------------------------
 if st.session_state.running and st.session_state.mode == "Auto":
     for _ in range(500):
-        if st.session_state.idx >= len(df) - 1:
+        if st.session_state.idx_pos >= len(active_indices) - 1:
             st.session_state.running = False
             break
-        render_dashboard(st.session_state.idx)
-        st.session_state.idx += 1
+        render_dashboard(int(active_indices[st.session_state.idx_pos]))
+        st.session_state.idx_pos += 1
         time.sleep(speed)
 else:
-    render_dashboard(st.session_state.idx)
+    render_dashboard(int(active_indices[st.session_state.idx_pos]))
     if st.session_state.mode == "Auto" and not st.session_state.running:
         st.markdown(
             '<div style="text-align:center;color:#64748b;'

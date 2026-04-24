@@ -151,14 +151,28 @@ def model_info(metrics: dict) -> str:
     model_type = metrics.get("model_type", "GBT + Isolation Forest")
     label_src = metrics.get("label_source", "Pseudo-Labels")
     n_events = metrics.get("n_report_events", 0)
+    split_strategy = metrics.get("split_strategy", "Chronological 80/20")
     label_display = f"{label_src} ({n_events} events)" if n_events else label_src
     label_color = "#22c55e" if "Report" in label_src else "#f59e0b"
 
     rows = [
         ("Model Type",       model_type, None),
         ("Label Source",     label_display, label_color),
+        ("Validation Split", split_strategy, "#38bdf8"),
         ("Features",         str(metrics.get("n_features", "—")), None),
         ("Training Samples", f'{metrics.get("n_samples", 0):,}', None),
+        ("Avg Pos Weight",   f'{metrics.get("avg_positive_weight", 0):.3f}', None),
+        ("Avg Neg Weight",   f'{metrics.get("avg_negative_weight", 0):.3f}', None),
+        ("PU Positives",     f'{metrics.get("pu_positive_count", 0):,}', None),
+        ("Reliable Negatives", f'{metrics.get("pu_reliable_negative_count", 0):,}', None),
+        ("Ambiguous Unlabeled", f'{metrics.get("pu_ambiguous_unlabeled_count", 0):,}', None),
+        ("Reactive Events",  str(metrics.get("n_reactive_events", 0)), None),
+        ("Scheduled Events", str(metrics.get("n_scheduled_events", 0)), None),
+        ("False Alerts/Day", f'{metrics.get("false_alerts_per_day", 0):.2f}', None),
+        ("Time Saved (h)*",  f'{metrics.get("time_saved_hours_proxy", 0):.1f}', "#22c55e"),
+        ("Reduced Cost ($)*", f'{metrics.get("reduced_cost_usd_proxy", 0):,.0f}', "#22c55e"),
+        ("Money Increase ($)*", f'{metrics.get("money_increase_usd_proxy", 0):,.0f}', "#22c55e"),
+        ("ROI Proxy (x)*",   f'{metrics.get("roi_proxy", 0):.2f}', "#22c55e"),
         ("AUC-ROC",          f'{metrics.get("auc_roc", 0):.4f}', "#22c55e"),
         ("Precision",        f'{metrics.get("precision", 0):.3f}', None),
         ("Recall",           f'{metrics.get("recall", 0):.3f}', None),
@@ -174,6 +188,14 @@ def model_info(metrics: dict) -> str:
             f'  <span class="model-stat-value"{style}>{value}</span>'
             '</div>'
         )
+    html += (
+        '<div class="model-stat" style="border-top:1px solid #334155;margin-top:6px;">'
+        '  <span class="model-stat-label" style="font-size:11px;color:#64748b;">'
+        '  * Proxy values use configurable cost/production assumptions'
+        '  </span>'
+        '  <span></span>'
+        '</div>'
+    )
     html += '</div>'
     return html
 

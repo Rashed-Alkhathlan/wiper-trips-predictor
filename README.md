@@ -187,7 +187,8 @@ The `report_parser.py` module extracts real operational events from 163 PDF dril
 **Label Strategy** (priority order):
 1. **Real labels** from reports when available (125 events, weight ≥ 0.7)
 2. **Pseudo-labels** from domain heuristics as supplement for uncovered periods
-3. **Blended**: Real labels dominate; pseudo-labels add only high-confidence (>0.5) points
+3. **Confidence weighting**: Reactive/precise-time events are weighted higher; likely scheduled/ambiguous events are weighted lower
+4. **Blended**: Real labels dominate; pseudo-labels add only high-confidence (>0.5) points
 
 ### Feature Engineering
 
@@ -239,12 +240,13 @@ The pipeline transforms **36 raw sensor channels** into **77 predictive features
 2. Engineer features → 77 columns
 3. Parse 163 PDF reports → 125 ground-truth events
 4. Map events to time series → binary labels (18.3% positive rate)
-5. StandardScaler normalization
-6. 80/20 stratified train/test split
-7. GBT: fit on training set (200 trees, depth 6, lr=0.1)
-8. IF: fit on full dataset (unsupervised)
-9. Evaluate on held-out test set
-10. Cache models via @st.cache_resource
+5. Build per-sample confidence weights from event profile + precursor anomaly
+6. StandardScaler normalization
+7. Chronological 80/20 train/test split (fallback to stratified split only if class coverage is invalid)
+8. GBT: fit on training set (200 trees, depth 6, lr=0.1) with sample weights
+9. IF: fit on full dataset (unsupervised)
+10. Evaluate on held-out test set
+11. Cache models via @st.cache_resource
 ```
 
 ### Model Performance
@@ -287,7 +289,7 @@ Contextual recommendations with analysis, interpretation, action items, and conf
 - **Ensemble (0.65 GBT + 0.35 IF)**: Weighted combination
 
 ### Model Information Panel
-Training summary with label source, event count, AUC-ROC, Precision, Recall, F1, Accuracy
+Training summary with label source, split strategy, confidence-weight diagnostics, and quality metrics (AUC-ROC, Precision, Recall, F1, Accuracy), plus proxy business impact outputs (time saved, reduced cost, money increase, ROI)
 
 ---
 
