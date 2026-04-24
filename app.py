@@ -11,6 +11,8 @@ HTML  → templates.py
 Model → model.py
 Logic → engine.py
 Reports → report_parser.py
+Advisor → advisor_chat.py  (AI chat module)
+Tools   → agent_tools.py   (sensor data tools)
 """
 
 import streamlit as st
@@ -28,6 +30,7 @@ from engine import (
 )
 from model import WiperTripPredictor
 import templates as T
+from advisor_chat import render_advisor_chat
 
 # ---------------------------------------------------------------------------
 # Page Config
@@ -375,3 +378,8 @@ else:
             'Press ▶ START to begin real-time streaming</div>',
             unsafe_allow_html=True,
         )
+
+# ---------------------------------------------------------------------------
+# AI Drilling Advisor (separate module)
+# ---------------------------------------------------------------------------
+render_advisor_chat(df)
