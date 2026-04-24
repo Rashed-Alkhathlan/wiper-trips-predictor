@@ -527,17 +527,22 @@ def _render_message(role, content, tools=None):
         # Process markdown for assistant responses
         safe = content
         # Headers: ### → section header, ## → subheader
-        safe = re.sub(r'^#{3,}\s*(.+)$', r'<div style="font-size:15px;font-weight:700;color:#38bdf8;margin:14px 0 8px;text-transform:uppercase;letter-spacing:0.5px;border-bottom:1px solid #1e293b;padding-bottom:5px;">\1</div>', safe, flags=re.MULTILINE)
-        safe = re.sub(r'^#{2}\s*(.+)$', r'<div style="font-size:16px;font-weight:700;color:#e2e8f0;margin:12px 0 8px;">\1</div>', safe, flags=re.MULTILINE)
-        safe = re.sub(r'^#\s*(.+)$', r'<div style="font-size:17px;font-weight:700;color:#f1f5f9;margin:12px 0 8px;">\1</div>', safe, flags=re.MULTILINE)
+        safe = re.sub(r'^\s*#{3,}\s*(.+)$', r'<div style="font-size:15px;font-weight:700;color:#38bdf8;margin:14px 0 8px;text-transform:uppercase;letter-spacing:0.5px;border-bottom:1px solid #1e293b;padding-bottom:5px;">\1</div>', safe, flags=re.MULTILINE)
+        safe = re.sub(r'^\s*#{2}\s*(.+)$', r'<div style="font-size:16px;font-weight:700;color:#e2e8f0;margin:12px 0 8px;">\1</div>', safe, flags=re.MULTILINE)
+        safe = re.sub(r'^\s*#\s*(.+)$', r'<div style="font-size:17px;font-weight:700;color:#f1f5f9;margin:12px 0 8px;">\1</div>', safe, flags=re.MULTILINE)
+        
+        # Remove LaTeX inline math markers \( and \)
+        safe = re.sub(r'\\\((.*?)\\\)', r'\1', safe)
+        
         # Bold: **text**
         safe = re.sub(r'\*\*(.+?)\*\*', r'<strong style="color:#f1f5f9;font-weight:600;">\1</strong>', safe)
         # Italic: *text*
         safe = re.sub(r'\*(.+?)\*', r'<em>\1</em>', safe)
-        # Bullet lists: - item
-        safe = re.sub(r'^[\-\*]\s+(.+)$', r'<div style="padding:3px 0 3px 14px;border-left:2px solid #334155;margin:3px 0;font-size:15px;">• \1</div>', safe, flags=re.MULTILINE)
-        # Numbered lists: 1. item
-        safe = re.sub(r'^(\d+)\.\s+(.+)$', r'<div style="padding:3px 0 3px 14px;border-left:2px solid #334155;margin:3px 0;font-size:15px;">\1. \2</div>', safe, flags=re.MULTILINE)
+        
+        # Bullet lists: - item (allow leading spaces)
+        safe = re.sub(r'^\s*[\-\*]\s+(.+)$', r'<div style="padding:3px 0 3px 14px;border-left:2px solid #334155;margin:3px 0;font-size:15px;">• \1</div>', safe, flags=re.MULTILINE)
+        # Numbered lists: 1. item (allow leading spaces)
+        safe = re.sub(r'^\s*(\d+)\.\s+(.+)$', r'<div style="padding:3px 0 3px 14px;border-left:2px solid #334155;margin:3px 0;font-size:15px;">\1. \2</div>', safe, flags=re.MULTILINE)
         # Line breaks
         safe = safe.replace("\n", "<br>")
         # Clean up double <br> after block elements
