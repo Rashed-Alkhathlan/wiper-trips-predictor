@@ -242,6 +242,7 @@ CHAT_CSS = """
     backdrop-filter: blur(12px);
     position: relative;
     overflow: hidden;
+    margin-bottom: 16px;
 }
 .advisor-box::before {
     content: '';
@@ -678,8 +679,15 @@ def render_advisor_chat(df):
 
     # ---- Input ----
     pending = st.session_state.pop("chat_pending", None)
-    user_input = st.chat_input("Ask the drilling advisor...", key="advisor_input")
-    question = pending or user_input
+    
+    with st.form(key="advisor_input_form", clear_on_submit=True, border=False):
+        col1, col2 = st.columns([5, 1])
+        with col1:
+            user_input = st.text_input("Ask the drilling advisor...", label_visibility="collapsed", placeholder="Ask the drilling advisor...")
+        with col2:
+            submit_btn = st.form_submit_button("Send", use_container_width=True)
+            
+    question = pending or (user_input if submit_btn and user_input.strip() else None)
 
     if question:
         st.session_state.chat_messages.append({"role": "user", "content": question})
