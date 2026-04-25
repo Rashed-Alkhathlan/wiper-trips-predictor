@@ -11,6 +11,8 @@ HTML  → templates.py
 Model → model.py
 Logic → engine.py
 Reports → report_parser.py
+Advisor → advisor_chat.py  (AI chat module)
+Tools   → agent_tools.py   (sensor data tools)
 """
 
 import streamlit as st
@@ -28,6 +30,7 @@ from engine import (
 )
 from model import WiperTripPredictor
 import templates as T
+from advisor_chat import render_advisor_chat
 
 # ---------------------------------------------------------------------------
 # Page Config
@@ -266,7 +269,7 @@ def render_dashboard(idx: int):
         # ---- LEFT: Metrics ----
         with left_col:
             st.markdown(T.section_title("Live Parameters"), unsafe_allow_html=True)
-            for key in ("WOB", "RPM", "TRQ", "ROP", "SPP", "FLOW_IN"):
+            for key in ("WOB", "RPM", "TRQ", "ROP", "SPP", "FLOW_IN", "MWD_INC"):
                 st.markdown(
                     T.metric_card(
                         label=DISPLAY_LABELS.get(key, key),
@@ -496,3 +499,8 @@ else:
             'Press ▶ START to begin real-time streaming</div>',
             unsafe_allow_html=True,
         )
+
+# ---------------------------------------------------------------------------
+# AI Drilling Advisor (separate module)
+# ---------------------------------------------------------------------------
+render_advisor_chat(df)

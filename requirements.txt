@@ -4,3 +4,9 @@ plotly
 numpy
 scikit-learn
 pymupdf
+# AI Advisor dependencies
+langchain
+langchain-ollama
+langgraph
+chromadb
+sentence-transformers
