@@ -1,3 +1,8 @@
+import os
+import warnings
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+warnings.filterwarnings("ignore", message=".*__path__.*")
+
 import streamlit as st
 
 # We must define the pages
@@ -194,14 +199,14 @@ def fleet_dashboard():
             </div>
             '''
             
-            # Using st.button with use_container_width to act as a clickable invisible overlay
+            # Using st.button with width="stretch" to act as a clickable invisible overlay
             # To make the whole card clickable nicely in Streamlit, we render the HTML and put a button over it, 
             # or just use a button for the logic.
             
             # Since Streamlit buttons are hard to style as complex cards, we use standard buttons
             # wait, we can just use a container. Streamlit 1.30+ has st.button(..., type="tertiary")
             
-            if st.button(f"Enter {rig['name']}", key=f"btn_{i}", use_container_width=True):
+            if st.button(f"Enter {rig['name']}", key=f"btn_{i}", width="stretch"):
                 if rig["real"]:
                     st.switch_page(rig_page)
                 else:
@@ -212,7 +217,7 @@ def fleet_dashboard():
 
 # Define pages
 fleet_page = st.Page(fleet_dashboard, title="Fleet Dashboard", icon="🌍", default=True)
-rig_page = st.Page("rig_dashboard.py", title="FORGE 16A(78)-32", icon="⚙️")
+rig_page = st.Page("app/rig_dashboard.py", title="FORGE 16A(78)-32", icon="⚙️")
 
 pg = st.navigation([fleet_page, rig_page])
 

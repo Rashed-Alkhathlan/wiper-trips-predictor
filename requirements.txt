@@ -4,6 +4,7 @@ plotly
 numpy
 scikit-learn
 pymupdf
+torchvision
 # AI Advisor dependencies
 langchain
 langchain-ollama
